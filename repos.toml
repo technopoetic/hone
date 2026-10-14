@@ -1,0 +1,24 @@
+# Static-check tool registry + per-repo enablement.
+#
+# Add a tool: define it once under [tools.<name>] with its argv (run from
+# pr-agent's own environment, cwd = the PR's worktree) — no code change
+# needed. Enable it for a repo by listing the name under [repos].
+#
+# A repo with no entry below gets no static checks at all (safe default —
+# see config.load_repo_config). A tool with no `command` here is a builtin
+# resolved in tools.py; only eslint needs that today, because its plugins
+# must load from pr-agent's own node_modules, never the PR branch's.
+
+[tools.ruff]
+command = ["ruff", "check", "."]
+
+[tools.mypy]
+command = ["mypy", "."]
+
+[tools.eslint]
+# builtin — see tools.py:_eslint_command
+
+[repos]
+mekanik = ["ruff", "mypy"]
+"mekanik-vue" = ["eslint"]
+"mekanik-registration" = ["eslint"]

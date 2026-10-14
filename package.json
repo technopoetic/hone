@@ -1,0 +1,9 @@
+{
+  "name": "pr-agent-tooling",
+  "private": true,
+  "description": "eslint + plugins pr-agent runs against target repos (see tools.py:_eslint_command). Never installed inside a worktree.",
+  "devDependencies": {
+    "eslint": "^10.12.0",
+    "eslint-plugin-vue": "^10.11.1"
+  }
+}

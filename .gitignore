@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+DEPLOY.local.md
+.pytest_cache/
+node_modules/
+tags
+tags.lock
+tags.temp
