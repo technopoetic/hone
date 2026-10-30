@@ -220,6 +220,13 @@ def create_app(secret: str, allowed_workspace: str,
                 return PlainTextResponse("ignored", status_code=200)
             if event == _GITHUB_COMMENT_EVENT:
                 try:
+                    # issue_comment also fires on edited/deleted, unlike
+                    # Bitbucket's create-only comment_created — a deleted
+                    # payload still carries the pre-delete body, so without
+                    # this gate, deleting (or editing into) an exact
+                    # command string would re-fire it.
+                    if payload.get("action") != "created":
+                        return PlainTextResponse("ignored", status_code=200)
                     # issue_comment fires for plain issues too; this key is
                     # how GitHub marks "this issue is actually a PR".
                     if not payload["issue"].get("pull_request"):

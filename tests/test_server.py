@@ -463,12 +463,13 @@ GITHUB_OTHER_ID = 2002
 def github_comment_payload(text: str, *, commenter: int = GITHUB_AUTHOR_ID,
                            author: int = GITHUB_AUTHOR_ID,
                            pr_number: int = 7,
-                           is_pr: bool = True) -> dict:
+                           is_pr: bool = True,
+                           action: str = "created") -> dict:
     issue: dict = {"number": pr_number, "user": {"id": author}}
     if is_pr:
         issue["pull_request"] = {"url": "https://api.github.com/..."}
     return {
-        "action": "created",
+        "action": action,
         "comment": {"body": text, "user": {"id": commenter}},
         "issue": issue,
         "repository": {"full_name": f"{GITHUB_OWNER}/hone"},
@@ -495,6 +496,19 @@ def test_github_review_command_enqueues_forced_review(github_receiver):
     assert r.status_code == 200
     assert queued == [ReviewRequest(workspace=GITHUB_OWNER, repo="hone",
                                     pr_id=7, force=True, forge="github")]
+
+
+@pytest.mark.parametrize("action", ["edited", "deleted"])
+def test_github_comment_non_created_action_is_ignored(github_receiver, action):
+    # a deleted payload still carries the pre-delete body — without the
+    # action gate, deleting (or editing into) an exact command string
+    # would re-fire it, unlike Bitbucket's create-only comment_created
+    client, queued = github_receiver
+    r = post_github_comment(
+        client, github_comment_payload("@hone mute", action=action))
+    assert r.status_code == 200
+    assert r.text == "ignored"
+    assert queued == []
 
 
 def test_github_comment_on_plain_issue_is_ignored(github_receiver):

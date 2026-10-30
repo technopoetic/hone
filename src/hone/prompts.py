@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from .bitbucket import PullRequest
+from .forge import PullRequest
 
 SYSTEM_PROMPT = """\
 You are an autonomous code reviewer for a solo developer's private repo.

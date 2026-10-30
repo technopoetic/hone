@@ -1,6 +1,6 @@
 import pytest
 
-from hone.cli import build_process, main, parse_pr_url
+from hone.cli import _github_repos, build_process, main, parse_pr_url
 from hone.config import Settings
 from hone.server import CommandRequest, ReviewRequest
 
@@ -57,6 +57,22 @@ def test_parse_valid_github_url():
 def test_parse_rejects_non_pr_urls(bad):
     with pytest.raises(ValueError):
         parse_pr_url(bad)
+
+
+def test_github_repos_use_their_own_data_dir_subtree(tmp_path):
+    # a repo with the same name under the same handle on both forges
+    # (e.g. "technopoetic/hone" on both) must not collide on one mirror
+    settings = Settings(
+        synthetic_api_key="sk", synthetic_model="m", bitbucket_email="e",
+        bitbucket_username="u", bitbucket_api_key="k",
+        bitbucket_workspace="ws", data_dir=tmp_path,
+        tool_commands={}, repo_checks={}, max_turns=7,
+        webhook_secret=None, port=8420, github_token="tok",
+        github_owner="technopoetic")
+
+    mgr = _github_repos(settings, tmp_path)
+
+    assert mgr.data_dir == tmp_path / "github"
 
 
 def test_build_process_runs_live_reviews(tmp_path, monkeypatch):

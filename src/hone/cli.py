@@ -48,10 +48,15 @@ def parse_pr_url(url: str) -> tuple[str, str, str, int]:
 
 
 def _github_repos(settings: Settings, data_dir) -> RepoManager:
+    # Own subdirectory, not the bare data_dir: mirrors are keyed only by
+    # namespace/repo (repo.py), so a repo with the same name under the
+    # same handle on both forges (e.g. "technopoetic/hone" on both) would
+    # otherwise collide on one mirror and fetch from the wrong remote.
+    #
     # GitHub's documented convention for PAT-over-git-HTTPS: any non-empty
     # username, the PAT as the password.
     return RepoManager(
-        data_dir=data_dir, username="x-access-token",
+        data_dir=data_dir / "github", username="x-access-token",
         api_key=settings.github_token,
         remote_url_for=lambda ns, repo: f"https://github.com/{ns}/{repo}.git")
 
@@ -127,14 +132,15 @@ def _serve() -> int:
 
     # One sweep per boot: the only safe moment is process start, before the
     # worker can be mid-review. Best-effort: cleanup failing must warn,
-    # never block startup. Mirrors/worktrees for every forge share one
-    # data_dir, so sweeping once (via either RepoManager) covers all of it.
-    try:
-        removed = repos.sweep_stale_worktrees()
-    except Exception as e:
-        print(f"warning: worktree sweep failed (continuing): {e}",
-              file=sys.stderr)
-        removed = 0
+    # never block startup. Each forge's RepoManager now has its own
+    # data_dir subtree (see _github_repos), so each needs its own sweep.
+    removed = 0
+    for mgr in repo_managers.values():
+        try:
+            removed += mgr.sweep_stale_worktrees()
+        except Exception as e:
+            print(f"warning: worktree sweep failed (continuing): {e}",
+                  file=sys.stderr)
     if removed:
         _log.info("swept %d stale worktree(s) from previous runs", removed)
 
