@@ -19,6 +19,8 @@ from .config import (
     load_settings,
     resolve_static_checks,
 )
+from .forge import Forge
+from .github import GitHubClient
 from .markers import control_comment
 from .repo import RepoManager
 from .review import ReviewJob, run_review
@@ -26,21 +28,40 @@ from .server import CommandRequest, ReviewRequest, serve
 
 _log = logging.getLogger("hone")
 
-_PR_URL = re.compile(
+_BITBUCKET_PR_URL = re.compile(
     r"https?://bitbucket\.org/([^/]+)/([^/]+)/pull-requests/(\d+)$")
+_GITHUB_PR_URL = re.compile(
+    r"https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 
 
-def parse_pr_url(url: str) -> tuple[str, str, int]:
-    m = _PR_URL.fullmatch(url.strip())
-    if not m:
-        raise ValueError(f"not a Bitbucket PR URL: {url}")
-    return m.group(1), m.group(2), int(m.group(3))
+def parse_pr_url(url: str) -> tuple[str, str, str, int]:
+    """(forge, namespace, repo, pr_id). `namespace` is Bitbucket's
+    workspace or GitHub's owner — same role, different forge's word."""
+    url = url.strip()
+    m = _BITBUCKET_PR_URL.fullmatch(url)
+    if m:
+        return "bitbucket", m.group(1), m.group(2), int(m.group(3))
+    m = _GITHUB_PR_URL.fullmatch(url)
+    if m:
+        return "github", m.group(1), m.group(2), int(m.group(3))
+    raise ValueError(f"not a Bitbucket or GitHub PR URL: {url}")
 
 
-def build_process(settings: Settings, bitbucket: BitbucketClient,
-                  repos: RepoManager) -> Callable[[ReviewRequest
-                                                   | CommandRequest], None]:
+def _github_repos(settings: Settings, data_dir) -> RepoManager:
+    # GitHub's documented convention for PAT-over-git-HTTPS: any non-empty
+    # username, the PAT as the password.
+    return RepoManager(
+        data_dir=data_dir, username="x-access-token",
+        api_key=settings.github_token,
+        remote_url_for=lambda ns, repo: f"https://github.com/{ns}/{repo}.git")
+
+
+def build_process(settings: Settings, *, forges: dict[str, Forge],
+                  repo_managers: dict[str, RepoManager]
+                  ) -> Callable[[ReviewRequest | CommandRequest], None]:
     """Turn a ReviewRequest/CommandRequest into one worker action.
+    `forges`/`repo_managers` are keyed by `req.forge` — whichever forges
+    are configured for this process.
 
     Review requests become one live (never dry-run) run_review call — the
     server has no dry-run mode, posting is its only behavior. Command
@@ -49,11 +70,12 @@ def build_process(settings: Settings, bitbucket: BitbucketClient,
     catches and logs them so one bad job never kills the server.
     """
     def process(req: ReviewRequest | CommandRequest) -> None:
+        forge = forges[req.forge]
         if isinstance(req, CommandRequest):
             _log.info("command %s for %s/%s#%d", req.action, req.workspace,
                       req.repo, req.pr_id)
-            bitbucket.post_comment(req.repo, req.pr_id,
-                                   control_comment(req.action))
+            forge.post_comment(req.repo, req.pr_id,
+                               control_comment(req.action))
             return
         job = ReviewJob(workspace=req.workspace, repo=req.repo,
                         pr_id=req.pr_id, dry_run=False, force=req.force,
@@ -61,7 +83,7 @@ def build_process(settings: Settings, bitbucket: BitbucketClient,
                         static_checks=resolve_static_checks(
                             settings, req.repo),
                         max_turns=settings.max_turns)
-        run_review(job, bitbucket=bitbucket, repos=repos,
+        run_review(job, forge=forge, repos=repo_managers[req.forge],
                    api_key=settings.synthetic_api_key)
 
     return process
@@ -96,9 +118,17 @@ def _serve() -> int:
     repos = RepoManager(data_dir=settings.data_dir,
                         username=settings.bitbucket_username,
                         api_key=settings.bitbucket_api_key)
+    forges: dict[str, Forge] = {"bitbucket": bitbucket}
+    repo_managers: dict[str, RepoManager] = {"bitbucket": repos}
+    if settings.github_token:
+        forges["github"] = GitHubClient(token=settings.github_token,
+                                        owner=settings.github_owner)
+        repo_managers["github"] = _github_repos(settings, settings.data_dir)
+
     # One sweep per boot: the only safe moment is process start, before the
     # worker can be mid-review. Best-effort: cleanup failing must warn,
-    # never block startup.
+    # never block startup. Mirrors/worktrees for every forge share one
+    # data_dir, so sweeping once (via either RepoManager) covers all of it.
     try:
         removed = repos.sweep_stale_worktrees()
     except Exception as e:
@@ -108,7 +138,8 @@ def _serve() -> int:
     if removed:
         _log.info("swept %d stale worktree(s) from previous runs", removed)
 
-    process = build_process(settings, bitbucket, repos)
+    process = build_process(settings, forges=forges,
+                            repo_managers=repo_managers)
     serve(settings, process_factory=lambda: process)
     return 0
 
@@ -117,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(
         prog="hone",
-        description="Autonomous Bitbucket PR review agent")
+        description="Autonomous PR review agent (Bitbucket, GitHub)")
     sub = parser.add_subparsers(dest="command", required=True)
     rev = sub.add_parser("review", help="review one pull request")
     rev.add_argument("url", help="full URL of the pull request")
@@ -131,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         return _serve()
 
     try:
-        workspace, repo, pr_id = parse_pr_url(args.url)
+        forge_name, namespace, repo, pr_id = parse_pr_url(args.url)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -140,18 +171,27 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    if forge_name == "github" and not settings.github_token:
+        print("error: GITHUB_TOKEN and GITHUB_OWNER are required to "
+              "review a GitHub PR", file=sys.stderr)
+        return 2
 
     # Same INFO stream to the console as before, plus a rotating file under
     # data_dir/logs so unattended serve runs leave an audit trail.
     log_path = configure_logging(settings.data_dir)
     _log.info("logging to %s", log_path)
 
-    bitbucket = BitbucketClient(email=settings.bitbucket_email,
+    if forge_name == "github":
+        forge: Forge = GitHubClient(token=settings.github_token,
+                                    owner=namespace)
+        repos = _github_repos(settings, settings.data_dir)
+    else:
+        forge = BitbucketClient(email=settings.bitbucket_email,
                                 api_key=settings.bitbucket_api_key,
-                                workspace=workspace)
-    repos = RepoManager(data_dir=settings.data_dir,
-                        username=settings.bitbucket_username,
-                        api_key=settings.bitbucket_api_key)
+                                workspace=namespace)
+        repos = RepoManager(data_dir=settings.data_dir,
+                            username=settings.bitbucket_username,
+                            api_key=settings.bitbucket_api_key)
     # Sweep orphaned job worktrees left by hard kills — only safe now, at
     # process start, when no review job can be running. Best-effort even at
     # this level: cleanup failing must warn, never block the review.
@@ -163,12 +203,12 @@ def main(argv: list[str] | None = None) -> int:
         removed = 0
     if removed:
         _log.info("swept %d stale worktree(s) from previous runs", removed)
-    job = ReviewJob(workspace=workspace, repo=repo, pr_id=pr_id,
+    job = ReviewJob(workspace=namespace, repo=repo, pr_id=pr_id,
                     dry_run=args.dry_run, model=settings.synthetic_model,
                     static_checks=resolve_static_checks(settings, repo),
                     max_turns=settings.max_turns)
     try:
-        result = run_review(job, bitbucket=bitbucket, repos=repos,
+        result = run_review(job, forge=forge, repos=repos,
                             api_key=settings.synthetic_api_key)
     except Exception as e:  # fail open: log, exit nonzero, nothing posted
         print(f"review failed (nothing posted): {e}", file=sys.stderr)

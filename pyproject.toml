@@ -1,7 +1,7 @@
 [project]
 name = "hone"
 version = "0.1.0"
-description = "Autonomous Bitbucket PR reviewer — an agent-building experiment"
+description = "Autonomous PR reviewer (Bitbucket, GitHub) — an agent-building experiment"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Richard Hibbitts" }]
