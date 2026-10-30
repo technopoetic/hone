@@ -17,7 +17,16 @@ alias, deploy path, pending rename runbook) lives in the gitignored
   one set without the other is a startup `ConfigError`. `GITHUB_WEBHOOK_SECRET`
   is checked only at `serve`-time — missing it just skips mounting
   `/webhook/github` (logged warning), it never refuses to start the
-  server (which still has to serve Bitbucket).
+  server (which still has to serve Bitbucket). **GitHub PAT gotcha:**
+  posting a PR comment goes through `POST /issues/{n}/comments` but
+  requires the fine-grained PAT's **Pull requests: write** permission,
+  not just **Issues: write** — even though the endpoint is nominally
+  "issues." Missing only the PR-write permission gives a clean `403
+  "Resource not accessible by personal access token"` on every write
+  while every read still succeeds, which looks exactly like a
+  repo-access or wrong-token problem and isn't. Confirmed empirically
+  against the live API, not reliably documented on GitHub's own REST
+  reference page.
 - **PR control plane:** comment `@hone mute` / `@hone unmute` /
   `@hone review` on a PR (comment must BE the command — exact text, any
   case/whitespace; only the PR author may issue one; hone's own marker

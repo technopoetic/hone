@@ -1,7 +1,7 @@
 # PR Agent — Design
 
 **Date:** 2026-09-17
-**Status:** Phase 2 implemented (2026-10-01, all checks green; live on the deployment host)
+**Status:** Phase 4 implemented (2026-10-30, all checks green; live on the deployment host) — see AGENTS.md for current architecture detail; this doc predates Phase 3/4 and is kept for historical context on the original design
 **Repo:** `hone` (renamed from `pr-agent`)
 
 ## Goal
@@ -307,7 +307,16 @@ update its own comments.
 2. **Webhook (Phase 2):** `server.py`, signature validation, serial queue,
    live comments. Success: push a branch, get a review comment without
    manual action.
-3. **Parked:** pytest execution (needs docker stack — likely its own small
+3. **Static checks (Phase 3):** `repos.toml` tool registry + per-repo
+   enablement (`config.py`, `tools.py`). Success: ESLint/ruff findings
+   surface in a review, scoped to an allowlist per repo.
+4. **GitHub support (Phase 4):** `forge.py`'s `Forge` Protocol +
+   `github.py`'s `GitHubClient`, a second `/webhook/github` route, and
+   per-forge dispatch throughout `cli.py`/`server.py`. Success (met
+   2026-10-30): hone reviewed its own GitHub support PR end-to-end via
+   its new webhook, found real issues, and confirmed them fixed on the
+   follow-up push. Gitea support is the same shape, not started.
+5. **Parked:** pytest execution (needs docker stack — likely its own small
    design), git pre-push hook adapter (same agent, different trigger),
    comment update/dedup, inline comments, Slack notification on HIGH
    severity.
