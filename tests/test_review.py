@@ -50,7 +50,7 @@ def test_dry_run_returns_text_and_cleans_up(tmp_path, fixture_repo,
 
     result = run_review(ReviewJob(workspace="ws", repo="repo", pr_id=7,
                                   dry_run=True),
-                        bitbucket=bb, repos=mgr, api_key="fake")
+                        forge=bb, repos=mgr, api_key="fake")
 
     assert result.posted is True
     assert bb.posted == []                 # dry run never posts
@@ -86,7 +86,7 @@ def test_dry_run_ignores_dedup_marker(tmp_path, fixture_repo, monkeypatch):
 
     result = run_review(ReviewJob(workspace="ws", repo="repo", pr_id=7,
                                   dry_run=True),
-                        bitbucket=bb, repos=mgr, api_key="fake")
+                        forge=bb, repos=mgr, api_key="fake")
 
     assert reached == ["fake"]          # agent actually ran
     assert result.skipped is False
@@ -112,7 +112,7 @@ def test_skips_when_head_already_reviewed(tmp_path, fixture_repo,
                       remote_url_for=lambda ws, repo: fixture_repo["url"])
 
     result = run_review(ReviewJob(workspace="ws", repo="repo", pr_id=7),
-                        bitbucket=bb, repos=mgr, api_key="fake")
+                        forge=bb, repos=mgr, api_key="fake")
 
     assert result.posted is False
     assert result.skipped is True
@@ -153,7 +153,7 @@ def test_skips_when_pr_is_muted(tmp_path, fixture_repo, monkeypatch):
                       remote_url_for=lambda ws, repo: fixture_repo["url"])
 
     result = run_review(ReviewJob(workspace="ws", repo="repo", pr_id=7),
-                        bitbucket=bb, repos=mgr, api_key="fake")
+                        forge=bb, repos=mgr, api_key="fake")
 
     assert result.skipped is True
     assert bb.posted == []
@@ -178,7 +178,7 @@ def test_force_review_runs_despite_mute_and_dedup(tmp_path, fixture_repo,
 
     result = run_review(ReviewJob(workspace="ws", repo="repo", pr_id=7,
                                   force=True),
-                        bitbucket=bb, repos=mgr, api_key="fake")
+                        forge=bb, repos=mgr, api_key="fake")
 
     assert result.skipped is False
     assert result.posted is True
@@ -201,7 +201,7 @@ def test_dry_run_ignores_mute(tmp_path, fixture_repo, monkeypatch):
 
     result = run_review(ReviewJob(workspace="ws", repo="repo", pr_id=7,
                                   dry_run=True),
-                        bitbucket=bb, repos=mgr, api_key="fake")
+                        forge=bb, repos=mgr, api_key="fake")
 
     assert result.skipped is False
 
@@ -239,6 +239,6 @@ def test_prior_reviews_flow_into_the_prompt(tmp_path, fixture_repo,
                       remote_url_for=lambda ws, repo: fixture_repo["url"])
 
     run_review(ReviewJob(workspace="ws", repo="repo", pr_id=7),
-               bitbucket=bb, repos=mgr, api_key="fake")
+               forge=bb, repos=mgr, api_key="fake")
 
     assert seen["previous_reviews"] == ["prior findings live here"]

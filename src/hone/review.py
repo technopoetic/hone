@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass, field
 
 from .agent import make_client, run_agent
-from .bitbucket import BitbucketClient
+from .forge import Forge
 from .markers import latest_control_state, prior_review_bodies
 from .prompts import SYSTEM_PROMPT, initial_context
 from .repo import RepoManager
@@ -42,16 +42,16 @@ class ReviewResult:
     skipped: bool = False
 
 
-def run_review(job: ReviewJob, *, bitbucket: BitbucketClient,
+def run_review(job: ReviewJob, *, forge: Forge,
                repos: RepoManager, api_key: str) -> ReviewResult:
-    pr = bitbucket.get_pull_request(job.repo, job.pr_id)
+    pr = forge.get_pull_request(job.repo, job.pr_id)
     # One comment fetch feeds all three standing checks: mute state, dedup,
     # and the delta prompt's previous rounds. Deliberately before
     # ensure_mirror: one paginated GET saves a fetch plus the whole agent
     # run when the PR is muted or the head was already reviewed. Dry runs
     # post nothing, so neither check protects anything there — and dry-run
     # is exactly how a human re-tests a prompt against a reviewed head.
-    comments = bitbucket.get_comments(job.repo, job.pr_id)
+    comments = forge.get_comments(job.repo, job.pr_id)
     if not job.dry_run and not job.force:
         if latest_control_state(comments) == "muted":
             log.info("pr #%d is muted — skipping review", job.pr_id)
@@ -62,7 +62,7 @@ def run_review(job: ReviewJob, *, bitbucket: BitbucketClient,
                      pr.source_commit)
             return ReviewResult(final_text=None, posted=False, skipped=True)
     previous_reviews = prior_review_bodies(comments)
-    diffstat = bitbucket.get_diffstat(job.repo, job.pr_id)
+    diffstat = forge.get_diffstat(job.repo, job.pr_id)
     mirror = repos.ensure_mirror(job.workspace, job.repo)
     worktree = repos.create_worktree(mirror, pr.source_commit)
     try:
@@ -73,7 +73,7 @@ def run_review(job: ReviewJob, *, bitbucket: BitbucketClient,
                 # the point of a dry run is to see what would be posted
                 print(markdown)
                 return
-            bitbucket.post_comment(job.repo, job.pr_id, markdown)
+            forge.post_comment(job.repo, job.pr_id, markdown)
 
         toolbox = ToolBox(repo_manager=repos, worktree=worktree,
                           base_sha=base, head_sha=pr.source_commit,

@@ -38,6 +38,13 @@ class Settings:
     # itself, keeping the CLI usable without a webhook secret.
     webhook_secret: str | None = None
     port: int = 8420
+    # GitHub support is all-or-nothing-but-optional: both set, or both
+    # unset — see load_settings. github_webhook_secret is checked only at
+    # serve-time (same deferred pattern as webhook_secret above), so the
+    # CLI `review` path works against a GitHub PR with no secret at all.
+    github_token: str | None = None
+    github_owner: str | None = None
+    github_webhook_secret: str | None = None
 
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
@@ -54,6 +61,16 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise ConfigError("Missing required env vars: " + ", ".join(missing))
+
+    # GitHub is optional, but all-or-nothing: partial config is almost
+    # certainly a typo, not an intentional half-setup, so fail fast rather
+    # than silently treating GitHub as unconfigured.
+    github_token = source.get("GITHUB_TOKEN") or None
+    github_owner = source.get("GITHUB_OWNER") or None
+    if bool(github_token) != bool(github_owner):
+        raise ConfigError(
+            "GITHUB_TOKEN and GITHUB_OWNER must be set together "
+            "(or both left unset to disable GitHub support)")
 
     repo_config_path = Path(source.get("HONE_REPO_CONFIG", "repos.toml"))
     tool_commands, repo_checks = load_repo_config(repo_config_path)
@@ -74,6 +91,9 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         max_turns=int(source.get("HONE_MAX_TURNS", "15")),
         webhook_secret=source.get("HONE_WEBHOOK_SECRET") or None,
         port=int(source.get("HONE_PORT", "8420")),
+        github_token=github_token,
+        github_owner=github_owner,
+        github_webhook_secret=source.get("GITHUB_WEBHOOK_SECRET") or None,
     )
 
 

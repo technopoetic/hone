@@ -3,23 +3,11 @@ Diffs and file contents come from the local worktree, not this API."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import httpx
 
+from .forge import PullRequest
+
 BASE_URL = "https://api.bitbucket.org/2.0"
-
-
-@dataclass(frozen=True)
-class PullRequest:
-    id: int
-    title: str
-    description: str
-    author: str
-    source_branch: str
-    source_commit: str  # PR head sha
-    dest_branch: str
-    dest_commit: str    # destination tip sha
 
 
 class BitbucketClient:

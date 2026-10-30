@@ -120,6 +120,33 @@ def test_webhook_settings_from_env(monkeypatch, tmp_path):
     assert s.port == 9000
 
 
+def test_github_settings_default_to_unconfigured(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    s = load_settings(FULL_ENV)
+    assert s.github_token is None
+    assert s.github_owner is None
+    assert s.github_webhook_secret is None
+
+
+def test_github_settings_from_env(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    s = load_settings({**FULL_ENV, "GITHUB_TOKEN": "gh-pat",
+                       "GITHUB_OWNER": "technopoetic",
+                       "GITHUB_WEBHOOK_SECRET": "gh-s3cr3t"})
+    assert s.github_token == "gh-pat"
+    assert s.github_owner == "technopoetic"
+    assert s.github_webhook_secret == "gh-s3cr3t"
+
+
+@pytest.mark.parametrize("partial", [
+    {"GITHUB_TOKEN": "gh-pat"},
+    {"GITHUB_OWNER": "technopoetic"},
+])
+def test_partial_github_config_is_a_config_error(partial):
+    with pytest.raises(ConfigError, match="GITHUB_TOKEN.*GITHUB_OWNER"):
+        load_settings({**FULL_ENV, **partial})
+
+
 def test_configure_logging_writes_to_rotating_file(
         tmp_path, restore_root_logging):
     log_path = configure_logging(tmp_path)

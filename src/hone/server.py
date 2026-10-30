@@ -1,5 +1,5 @@
-"""Webhook receiver. Accept fast, enqueue, return 200 — the worker thread
-owes Bitbucket nothing."""
+"""Webhook receiver (Bitbucket + GitHub). Accept fast, enqueue, return
+200 — the worker thread owes neither forge anything."""
 
 from __future__ import annotations
 
@@ -22,6 +22,14 @@ _REVIEW_EVENTS = {"pullrequest:created", "pullrequest:updated"}
 # comment_created carries the human control plane: @hone commands
 _ALL_EVENTS = _REVIEW_EVENTS | {"pullrequest:comment_created"}
 
+# GitHub's equivalents: opened/synchronize/reopened trigger a review the
+# same way Bitbucket's created/updated do; issue_comment is GitHub's event
+# for a top-level PR comment (there is no separate "pull request comment"
+# event — PRs are issues as far as the Comments API is concerned).
+_GITHUB_REVIEW_ACTIONS = {"opened", "synchronize", "reopened"}
+_GITHUB_PR_EVENT = "pull_request"
+_GITHUB_COMMENT_EVENT = "issue_comment"
+
 # hone's own comments all carry one of these markers; the sentinel stops
 # the agent reacting to its own posts (it posts as the owner's account, so
 # the author gate alone cannot distinguish its output from a human command)
@@ -39,11 +47,14 @@ _COMMANDS = {
 
 @dataclass(frozen=True)
 class ReviewRequest:
+    # "workspace" doubles as GitHub's "owner" — same role (the namespace a
+    # repo lives under), different forge's word for it.
     workspace: str
     repo: str
     pr_id: int
     # @hone review: bypass mute state and the same-head dedup marker.
     force: bool = False
+    forge: str = "bitbucket"
 
 
 @dataclass(frozen=True)
@@ -54,35 +65,60 @@ class CommandRequest:
     repo: str
     pr_id: int
     action: str
+    forge: str = "bitbucket"
 
 
-def _command_from_comment(payload: dict, *, workspace: str, repo: str,
-                          pr_id: int) -> ReviewRequest | CommandRequest | None:
-    """Route one comment_created payload to its request, or None when the
-    comment is not an authorized command. Authorization is exact-command
-    text PLUS author identity (fail closed on missing identity)."""
-    comment = payload.get("comment") or {}
-    text = (comment.get("content") or {}).get("raw") or ""
+def _route_command(text: str, actor_id: str | int | None,
+                   author_id: str | int | None, *, forge: str,
+                   workspace: str, repo: str, pr_id: int
+                   ) -> ReviewRequest | CommandRequest | None:
+    """Shared trust gate for both forges' comment-command surface, so a
+    future change to either rule can't accidentally apply to only one
+    forge. AGENTS.md is explicit that neither may be relaxed: the comment
+    text must exactly BE the command (bodies are untrusted data, never
+    fed to the LLM as instructions), and only the PR author's own identity
+    (fail closed on a missing one) may issue one."""
     if _OWN_MARKER_SENTINEL in text:
         return None
     action = _COMMANDS.get(text.strip().casefold())
     if action is None:
         return None
-    # Trust gate: only the PR author commands the agent. Compare Bitbucket
-    # uuids (stable across renames, unlike display names); a missing uuid
-    # means unauthorized, never authorized.
-    actor = (payload.get("actor") or {}).get("uuid")
-    author = ((payload.get("pullrequest") or {}).get("author")
-              or {}).get("uuid")
-    if not actor or actor != author:
+    if not actor_id or actor_id != author_id:
         log.warning("comment command %r on pr #%d rejected: commenter is "
                     "not the PR author", action, pr_id)
         return None
     if action == "review":
         return ReviewRequest(workspace=workspace, repo=repo, pr_id=pr_id,
-                             force=True)
+                             force=True, forge=forge)
     return CommandRequest(workspace=workspace, repo=repo, pr_id=pr_id,
-                          action=action)
+                          action=action, forge=forge)
+
+
+def _command_from_comment(payload: dict, *, workspace: str, repo: str,
+                          pr_id: int) -> ReviewRequest | CommandRequest | None:
+    """Route one Bitbucket comment_created payload."""
+    comment = payload.get("comment") or {}
+    text = (comment.get("content") or {}).get("raw") or ""
+    # Compare Bitbucket uuids (stable across renames, unlike display names).
+    actor = (payload.get("actor") or {}).get("uuid")
+    author = ((payload.get("pullrequest") or {}).get("author")
+              or {}).get("uuid")
+    return _route_command(text, actor, author, forge="bitbucket",
+                          workspace=workspace, repo=repo, pr_id=pr_id)
+
+
+def _github_command_from_comment(payload: dict, *, owner: str, repo: str,
+                                 pr_id: int
+                                 ) -> ReviewRequest | CommandRequest | None:
+    """Route one GitHub issue_comment payload (already confirmed to carry
+    an `issue.pull_request` key, i.e. it's a comment on a PR, not a plain
+    issue)."""
+    text = (payload.get("comment") or {}).get("body") or ""
+    # Compare GitHub's numeric user ids (stable across username renames).
+    actor = (payload.get("comment") or {}).get("user", {}).get("id")
+    author = (payload.get("issue") or {}).get("user", {}).get("id")
+    return _route_command(text, actor, author, forge="github",
+                          workspace=owner, repo=repo, pr_id=pr_id)
 
 
 def _valid(secret: str, body: bytes, header: str | None) -> bool:
@@ -97,10 +133,15 @@ def _valid(secret: str, body: bytes, header: str | None) -> bool:
 
 
 def create_app(secret: str, allowed_workspace: str,
-               enqueue: Callable[[ReviewRequest | CommandRequest], None]
-               ) -> FastAPI:
+               enqueue: Callable[[ReviewRequest | CommandRequest], None],
+               *, github_secret: str | None = None,
+               github_owner: str | None = None) -> FastAPI:
     """Build the webhook app. `enqueue` is injected so tests (and any
-    future wiring) can swap the real queue for a sink of their choosing."""
+    future wiring) can swap the real queue for a sink of their choosing.
+    `/webhook` (Bitbucket) is always mounted. `/webhook/github` is mounted
+    only when both GitHub args are given — same "no entry = off" safe
+    default repos.toml already uses, rather than a route that exists but
+    can never validate anything."""
     app = FastAPI()
 
     @app.get("/health")
@@ -152,6 +193,65 @@ def create_app(secret: str, allowed_workspace: str,
         enqueue(ReviewRequest(workspace=workspace, repo=slug, pr_id=pr_id))
         return PlainTextResponse("queued", status_code=200)
 
+    if github_secret and github_owner:
+        @app.post("/webhook/github")
+        async def webhook_github(request: Request) -> PlainTextResponse:
+            body = await request.body()
+            if not _valid(github_secret, body,
+                          request.headers.get("x-hub-signature-256")):
+                log.warning("github webhook rejected: bad signature")
+                return PlainTextResponse("forbidden", status_code=403)
+            event = request.headers.get("x-github-event", "")
+            if event not in (_GITHUB_PR_EVENT, _GITHUB_COMMENT_EVENT):
+                return PlainTextResponse("ignored", status_code=200)
+            try:
+                payload = await request.json()
+                owner, _, slug = (
+                    payload["repository"]["full_name"].partition("/"))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                log.warning("unparseable github webhook payload "
+                            "(event %r) ignored", event)
+                return PlainTextResponse("ignored", status_code=200)
+            if owner != github_owner:
+                # Same reasoning as the Bitbucket workspace pin above: a
+                # forged payload must not pick the clone target.
+                log.warning("github webhook for foreign owner %r ignored",
+                            owner)
+                return PlainTextResponse("ignored", status_code=200)
+            if event == _GITHUB_COMMENT_EVENT:
+                try:
+                    # issue_comment also fires on edited/deleted, unlike
+                    # Bitbucket's create-only comment_created — a deleted
+                    # payload still carries the pre-delete body, so without
+                    # this gate, deleting (or editing into) an exact
+                    # command string would re-fire it.
+                    if payload.get("action") != "created":
+                        return PlainTextResponse("ignored", status_code=200)
+                    # issue_comment fires for plain issues too; this key is
+                    # how GitHub marks "this issue is actually a PR".
+                    if not payload["issue"].get("pull_request"):
+                        return PlainTextResponse("ignored", status_code=200)
+                    pr_id = payload["issue"]["number"]
+                except (KeyError, TypeError, AttributeError):
+                    log.warning("unparseable github comment payload ignored")
+                    return PlainTextResponse("ignored", status_code=200)
+                command = _github_command_from_comment(
+                    payload, owner=owner, repo=slug, pr_id=pr_id)
+                if command is None:
+                    return PlainTextResponse("ignored", status_code=200)
+                enqueue(command)
+                return PlainTextResponse("queued", status_code=200)
+            try:
+                if payload.get("action") not in _GITHUB_REVIEW_ACTIONS:
+                    return PlainTextResponse("ignored", status_code=200)
+                pr_id = payload["pull_request"]["number"]
+            except (KeyError, TypeError, AttributeError):
+                log.warning("unparseable github pull_request payload ignored")
+                return PlainTextResponse("ignored", status_code=200)
+            enqueue(ReviewRequest(workspace=owner, repo=slug, pr_id=pr_id,
+                                  forge="github"))
+            return PlainTextResponse("queued", status_code=200)
+
     return app
 
 
@@ -190,12 +290,22 @@ def serve(settings: Settings, *,
 
     if not settings.webhook_secret:
         raise SystemExit("HONE_WEBHOOK_SECRET is required for serve")
+    # GitHub is optional even when configured for the CLI: a missing
+    # webhook secret must only disable the GitHub route, never refuse to
+    # start the whole server (which still has to serve Bitbucket).
+    github_secret = settings.github_webhook_secret
+    github_owner = settings.github_owner
+    if settings.github_token and not github_secret:
+        log.warning("GITHUB_TOKEN is set but GITHUB_WEBHOOK_SECRET is not — "
+                    "/webhook/github will not be mounted")
+        github_secret = github_owner = None
     q: queue.Queue[ReviewRequest | CommandRequest | None] = queue.Queue()
     threading.Thread(target=run_worker, args=(q, process_factory()),
                      daemon=True).start()
     app = create_app(settings.webhook_secret,
                      allowed_workspace=settings.bitbucket_workspace,
-                     enqueue=q.put)
+                     enqueue=q.put, github_secret=github_secret,
+                     github_owner=github_owner)
     # Loopback only: nginx fronts this as the public edge on the droplet.
     # Binding a routable interface would expose the raw port — no body
     # limits in front of a handler that buffers request.body() before

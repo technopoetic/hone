@@ -341,7 +341,8 @@ def test_serve_binds_loopback_only(monkeypatch):
     monkeypatch.setattr("uvicorn.run", fake_run)
     settings = SimpleNamespace(webhook_secret=SECRET,
                                bitbucket_workspace="hmdatasolutions",
-                               port=8420)
+                               port=8420, github_token=None,
+                               github_owner=None, github_webhook_secret=None)
     serve(settings, process_factory=lambda: lambda req: None)
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == settings.port
@@ -350,7 +351,8 @@ def test_serve_binds_loopback_only(monkeypatch):
 def test_serve_refuses_to_start_without_secret():
     settings = SimpleNamespace(webhook_secret=None,
                                bitbucket_workspace="hmdatasolutions",
-                               port=8420)
+                               port=8420, github_token=None,
+                               github_owner=None, github_webhook_secret=None)
     with pytest.raises(SystemExit):
         serve(settings, process_factory=lambda: lambda req: None)
 
@@ -361,3 +363,184 @@ def test_health_endpoint_answers_unauthenticated(receiver):
     resp = client.get("/health")
     assert resp.status_code == 200
     assert "ok" in resp.text
+
+
+# --- GitHub webhook (/webhook/github) -----------------------------------
+
+GITHUB_SECRET = "gh-s3cr3t"
+GITHUB_OWNER = "technopoetic"
+
+
+@pytest.fixture
+def github_receiver():
+    queued: list[ReviewRequest | CommandRequest] = []
+    app = create_app(secret=SECRET, allowed_workspace="hmdatasolutions",
+                     enqueue=queued.append, github_secret=GITHUB_SECRET,
+                     github_owner=GITHUB_OWNER)
+    return TestClient(app), queued
+
+
+def post_github(client: TestClient, body: bytes, *, event: str,
+                signature: str | None = None):
+    headers = {"X-GitHub-Event": event}
+    if signature is not None:
+        headers["X-Hub-Signature-256"] = signature
+    return client.post("/webhook/github", content=body, headers=headers)
+
+
+def pr_event_payload(action: str = "opened", pr_number: int = 7) -> dict:
+    return {
+        "action": action,
+        "pull_request": {"number": pr_number},
+        "repository": {"full_name": f"{GITHUB_OWNER}/hone"},
+    }
+
+
+def test_github_route_is_absent_when_not_configured(receiver):
+    # create_app without github_secret/github_owner: the route doesn't
+    # exist at all, not merely unauthorized — 404, not 403.
+    client, _ = receiver
+    r = client.post("/webhook/github", content=b"{}",
+                    headers={"X-GitHub-Event": "pull_request"})
+    assert r.status_code == 404
+
+
+def test_github_missing_signature_is_forbidden(github_receiver):
+    client, queued = github_receiver
+    r = post_github(client, json.dumps(pr_event_payload()).encode(),
+                    event="pull_request")
+    assert r.status_code == 403
+    assert queued == []
+
+
+def test_github_wrong_signature_is_forbidden(github_receiver):
+    client, queued = github_receiver
+    body = json.dumps(pr_event_payload()).encode()
+    r = post_github(client, body, event="pull_request",
+                    signature=sign(body, "not-the-secret"))
+    assert r.status_code == 403
+    assert queued == []
+
+
+@pytest.mark.parametrize("action", ["opened", "synchronize", "reopened"])
+def test_github_review_actions_enqueue_review(github_receiver, action):
+    client, queued = github_receiver
+    body = json.dumps(pr_event_payload(action=action)).encode()
+    r = post_github(client, body, event="pull_request",
+                    signature=sign(body, GITHUB_SECRET))
+    assert r.status_code == 200
+    assert r.text == "queued"
+    assert queued == [ReviewRequest(workspace=GITHUB_OWNER, repo="hone",
+                                    pr_id=7, forge="github")]
+
+
+def test_github_other_pr_actions_are_ignored(github_receiver):
+    client, queued = github_receiver
+    body = json.dumps(pr_event_payload(action="closed")).encode()
+    r = post_github(client, body, event="pull_request",
+                    signature=sign(body, GITHUB_SECRET))
+    assert r.status_code == 200
+    assert r.text == "ignored"
+    assert queued == []
+
+
+def test_github_foreign_owner_is_ignored(github_receiver):
+    client, queued = github_receiver
+    payload = pr_event_payload()
+    payload["repository"]["full_name"] = "someoneelse/otherrepo"
+    body = json.dumps(payload).encode()
+    r = post_github(client, body, event="pull_request",
+                    signature=sign(body, GITHUB_SECRET))
+    assert r.status_code == 200
+    assert r.text == "ignored"
+    assert queued == []
+
+
+GITHUB_AUTHOR_ID = 1001
+GITHUB_OTHER_ID = 2002
+
+
+def github_comment_payload(text: str, *, commenter: int = GITHUB_AUTHOR_ID,
+                           author: int = GITHUB_AUTHOR_ID,
+                           pr_number: int = 7,
+                           is_pr: bool = True,
+                           action: str = "created") -> dict:
+    issue: dict = {"number": pr_number, "user": {"id": author}}
+    if is_pr:
+        issue["pull_request"] = {"url": "https://api.github.com/..."}
+    return {
+        "action": action,
+        "comment": {"body": text, "user": {"id": commenter}},
+        "issue": issue,
+        "repository": {"full_name": f"{GITHUB_OWNER}/hone"},
+    }
+
+
+def post_github_comment(client: TestClient, payload: dict):
+    body = json.dumps(payload).encode()
+    return post_github(client, body, event="issue_comment",
+                       signature=sign(body, GITHUB_SECRET))
+
+
+def test_github_mute_command_from_author_enqueues_command(github_receiver):
+    client, queued = github_receiver
+    r = post_github_comment(client, github_comment_payload("@hone mute"))
+    assert r.status_code == 200
+    assert queued == [CommandRequest(workspace=GITHUB_OWNER, repo="hone",
+                                     pr_id=7, action="mute", forge="github")]
+
+
+def test_github_review_command_enqueues_forced_review(github_receiver):
+    client, queued = github_receiver
+    r = post_github_comment(client, github_comment_payload("@hone review"))
+    assert r.status_code == 200
+    assert queued == [ReviewRequest(workspace=GITHUB_OWNER, repo="hone",
+                                    pr_id=7, force=True, forge="github")]
+
+
+@pytest.mark.parametrize("action", ["edited", "deleted"])
+def test_github_comment_non_created_action_is_ignored(github_receiver, action):
+    # a deleted payload still carries the pre-delete body — without the
+    # action gate, deleting (or editing into) an exact command string
+    # would re-fire it, unlike Bitbucket's create-only comment_created
+    client, queued = github_receiver
+    r = post_github_comment(
+        client, github_comment_payload("@hone mute", action=action))
+    assert r.status_code == 200
+    assert r.text == "ignored"
+    assert queued == []
+
+
+def test_github_comment_on_plain_issue_is_ignored(github_receiver):
+    # issue_comment fires for issues too; issue.pull_request is how GitHub
+    # marks "this is actually a PR" — without it, never treat it as one.
+    client, queued = github_receiver
+    r = post_github_comment(
+        client, github_comment_payload("@hone mute", is_pr=False))
+    assert r.status_code == 200
+    assert queued == []
+
+
+def test_github_command_from_non_author_is_ignored(github_receiver):
+    client, queued = github_receiver
+    r = post_github_comment(
+        client, github_comment_payload("@hone mute",
+                                       commenter=GITHUB_OTHER_ID))
+    assert r.status_code == 200
+    assert queued == []
+
+
+def test_github_own_marker_comments_never_trigger_commands(github_receiver):
+    client, queued = github_receiver
+    text = "<!-- hone:review:abc -->\n@hone mute"
+    r = post_github_comment(client, github_comment_payload(text))
+    assert r.status_code == 200
+    assert queued == []
+
+
+def test_github_plain_comment_triggers_nothing(github_receiver):
+    client, queued = github_receiver
+    r = post_github_comment(client, github_comment_payload("looks good"))
+    assert r.status_code == 200
+    assert r.text == "ignored"
+    assert queued == []
