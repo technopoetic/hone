@@ -43,8 +43,10 @@ alias, deploy path, pending rename runbook) lives in the gitignored
   `pullrequest:comment_created`, or commands never fire. The GitHub
   webhook (when GitHub support is on) needs `pull_request` +
   `issue_comment`, content type `application/json`, same reason.
-- **Stack:** Python ≥3.12, uv, raw `anthropic` SDK (base URL pointed at
-  Synthetic.new), `httpx`, `python-dotenv`, `fastapi` + `uvicorn`.
+- **Stack:** Python ≥3.12, uv, raw `anthropic` SDK (`LLM_BASE_URL` points
+  it at any Anthropic-Messages-API-compatible endpoint — Synthetic.new,
+  Anthropic directly, a self-hosted proxy; unset means Anthropic
+  directly), `httpx`, `python-dotenv`, `fastapi` + `uvicorn`.
   Node (eslint + eslint-plugin-vue) for the one static check that needs
   it — see `package.json`, installed separately from the Python venv.
 - **Layout:** `src/hone/` — config, forge (shared `PullRequest` + the

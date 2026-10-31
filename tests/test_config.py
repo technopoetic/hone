@@ -29,7 +29,8 @@ def restore_root_logging():
 
 
 FULL_ENV = {
-    "SYNTHETIC_API_KEY": "sk-syn-test",
+    "LLM_API_KEY": "sk-test",
+    "LLM_MODEL": "claude-sonnet-5-5",
     "BITBUCKET_EMAIL": "rich@example.com",
     "BITBUCKET_API_KEY": "bb-token",
     "BITBUCKET_WORKSPACE": "test-workspace",
@@ -41,8 +42,9 @@ def test_full_env_loads_with_defaults(monkeypatch, tmp_path):
     # explode, it should just come back with empty registries
     monkeypatch.chdir(tmp_path)
     s = load_settings(FULL_ENV)
-    assert s.synthetic_api_key == "sk-syn-test"
-    assert s.synthetic_model == "syn:large:text"
+    assert s.llm_api_key == "sk-test"
+    assert s.llm_model == "claude-sonnet-5-5"
+    assert s.llm_base_url is None     # unset = talk to Anthropic directly
     assert s.bitbucket_workspace == "test-workspace"
     assert s.tool_commands == {}
     assert s.repo_checks == {}
@@ -50,11 +52,19 @@ def test_full_env_loads_with_defaults(monkeypatch, tmp_path):
     assert str(s.data_dir).endswith("hone")
 
 
+def test_llm_base_url_from_env(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    s = load_settings({**FULL_ENV,
+                       "LLM_BASE_URL": "https://api.synthetic.new/anthropic"})
+    assert s.llm_base_url == "https://api.synthetic.new/anthropic"
+
+
 def test_missing_required_lists_every_gap():
     with pytest.raises(ConfigError) as err:
         load_settings({})
     msg = str(err.value)
-    assert "SYNTHETIC_API_KEY" in msg
+    assert "LLM_API_KEY" in msg
+    assert "LLM_MODEL" in msg
     assert "BITBUCKET_EMAIL" in msg
     assert "BITBUCKET_API_KEY" in msg
 
@@ -91,7 +101,7 @@ def test_repo_config_warns_on_unknown_tool(tmp_path, caplog):
 
 
 def test_resolve_static_checks_scopes_to_one_repo():
-    s = Settings(synthetic_api_key="k", synthetic_model="m",
+    s = Settings(llm_api_key="k", llm_model="m",
                 bitbucket_email="e", bitbucket_username="u",
                 bitbucket_api_key="k", bitbucket_workspace="ws",
                 data_dir=Path("/tmp"),

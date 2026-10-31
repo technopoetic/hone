@@ -10,8 +10,6 @@ import anthropic
 
 from .prompts import FINAL_TURN_MESSAGE
 
-SYNTHETIC_BASE_URL = "https://api.synthetic.new/anthropic"
-
 log = logging.getLogger("hone")
 
 
@@ -21,10 +19,13 @@ class AgentOutcome:
     posted: bool
 
 
-def make_client(api_key: str) -> anthropic.Anthropic:
+def make_client(api_key: str, base_url: str | None = None) -> anthropic.Anthropic:
     # No default timeout on the SDK is not acceptable: one hung request
     # would freeze the whole review job (and later, a webhook worker).
-    return anthropic.Anthropic(api_key=api_key, base_url=SYNTHETIC_BASE_URL,
+    # base_url=None is the SDK's own default (ANTHROPIC_BASE_URL env, else
+    # Anthropic's own API) — any Anthropic-Messages-API-compatible endpoint
+    # works here, not just Synthetic.new.
+    return anthropic.Anthropic(api_key=api_key, base_url=base_url,
                                timeout=300.0, max_retries=1)
 
 

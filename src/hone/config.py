@@ -19,8 +19,8 @@ class ConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class Settings:
-    synthetic_api_key: str
-    synthetic_model: str
+    llm_api_key: str
+    llm_model: str
     bitbucket_email: str
     bitbucket_username: str  # git-over-HTTPS needs username, not email
     bitbucket_api_key: str
@@ -45,6 +45,10 @@ class Settings:
     github_token: str | None = None
     github_owner: str | None = None
     github_webhook_secret: str | None = None
+    # None = talk to Anthropic's own API directly (the SDK's default).
+    # Set to point at any Anthropic-Messages-API-compatible endpoint —
+    # Synthetic.new, a self-hosted proxy, etc.
+    llm_base_url: str | None = None
 
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
@@ -53,7 +57,8 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     source = os.environ if env is None else env
 
     required = {
-        "SYNTHETIC_API_KEY": source.get("SYNTHETIC_API_KEY"),
+        "LLM_API_KEY": source.get("LLM_API_KEY"),
+        "LLM_MODEL": source.get("LLM_MODEL"),
         "BITBUCKET_EMAIL": source.get("BITBUCKET_EMAIL"),
         "BITBUCKET_API_KEY": source.get("BITBUCKET_API_KEY"),
         "BITBUCKET_WORKSPACE": source.get("BITBUCKET_WORKSPACE"),
@@ -76,8 +81,9 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     tool_commands, repo_checks = load_repo_config(repo_config_path)
 
     return Settings(
-        synthetic_api_key=required["SYNTHETIC_API_KEY"],
-        synthetic_model=source.get("SYNTHETIC_MODEL", "syn:large:text"),
+        llm_api_key=required["LLM_API_KEY"],
+        llm_model=required["LLM_MODEL"],
+        llm_base_url=source.get("LLM_BASE_URL") or None,
         bitbucket_email=required["BITBUCKET_EMAIL"],
         bitbucket_username=(source.get("BITBUCKET_USERNAME")
                             or required["BITBUCKET_EMAIL"]),

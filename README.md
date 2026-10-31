@@ -1,8 +1,10 @@
 # hone
 
 Autonomous Bitbucket Cloud PR reviewer — an agent-building experiment.
-Raw Anthropic SDK pointed at Synthetic.new, six investigation tools on a
-throwaway git worktree, one comment per review. No frameworks.
+Raw Anthropic SDK, `base_url` pointed at any Anthropic-Messages-API-
+compatible endpoint (Synthetic.new, Anthropic directly, a self-hosted
+proxy), six investigation tools on a throwaway git worktree, one comment
+per review. No frameworks.
 
 Formerly `pr-agent` — renamed to avoid colliding with Qodo's open-source
 project of the same name.
@@ -10,8 +12,9 @@ project of the same name.
 ## Setup
 
     uv sync
-    cp .env.example .env   # fill in SYNTHETIC_API_KEY, BITBUCKET_EMAIL,
+    cp .env.example .env   # fill in LLM_API_KEY, LLM_MODEL, BITBUCKET_EMAIL,
                            # BITBUCKET_API_KEY, and BITBUCKET_WORKSPACE
+                           # (LLM_BASE_URL only if not using Anthropic directly)
 
 `BITBUCKET_API_KEY` = the same value as your `ATLASSIAN_API_KEY`.
 Requires git and `ripgrep` (`rg`) on PATH. Static-check binaries run from

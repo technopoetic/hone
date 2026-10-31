@@ -26,7 +26,7 @@ class ReviewJob:
     # @hone review: bypass the mute state and the same-head dedup
     # marker — an explicit human command overrides both standing skips.
     force: bool = False
-    model: str = "syn:large:text"
+    model: str = "claude-sonnet-5-5"
     # tool name -> argv (None = builtin), already resolved for `repo` via
     # config.resolve_static_checks — this repo's slice of repos.toml, not
     # the whole registry.
@@ -42,8 +42,8 @@ class ReviewResult:
     skipped: bool = False
 
 
-def run_review(job: ReviewJob, *, forge: Forge,
-               repos: RepoManager, api_key: str) -> ReviewResult:
+def run_review(job: ReviewJob, *, forge: Forge, repos: RepoManager,
+               api_key: str, base_url: str | None = None) -> ReviewResult:
     pr = forge.get_pull_request(job.repo, job.pr_id)
     # One comment fetch feeds all three standing checks: mute state, dedup,
     # and the delta prompt's previous rounds. Deliberately before
@@ -78,7 +78,7 @@ def run_review(job: ReviewJob, *, forge: Forge,
         toolbox = ToolBox(repo_manager=repos, worktree=worktree,
                           base_sha=base, head_sha=pr.source_commit,
                           static_checks=job.static_checks, post=post)
-        client = make_client(api_key)
+        client = make_client(api_key, base_url)
         outcome = run_agent(client, model=job.model, system=SYSTEM_PROMPT,
                             initial_context=initial_context(
                                 pr, diffstat,

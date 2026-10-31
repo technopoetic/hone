@@ -39,7 +39,7 @@ def test_dry_run_returns_text_and_cleans_up(tmp_path, fixture_repo,
     ]
     monkeypatch.setattr(
         "hone.review.make_client",
-        lambda api_key: FakeClientWrapper(responses),
+        lambda api_key, base_url=None: FakeClientWrapper(responses),
     )
     from hone.repo import RepoManager
 
@@ -73,7 +73,7 @@ def test_dry_run_ignores_dedup_marker(tmp_path, fixture_repo, monkeypatch):
                      stop_reason="end_turn"),
     ]
 
-    def make_client(api_key):
+    def make_client(api_key, base_url=None):
         reached.append(api_key)
         return FakeClientWrapper(responses)
     monkeypatch.setattr("hone.review.make_client", make_client)
@@ -101,7 +101,7 @@ def test_skips_when_head_already_reviewed(tmp_path, fixture_repo,
     bb = FakeBitbucket(fixture_repo, comments=[prior])
 
     # the dedup check must fire before any LLM client is even constructed
-    def boom(api_key):
+    def boom(api_key, base_url=None):
         raise AssertionError("make_client must not be called on a skip")
     monkeypatch.setattr("hone.review.make_client", boom)
 
@@ -142,7 +142,7 @@ def test_skips_when_pr_is_muted(tmp_path, fixture_repo, monkeypatch):
     # worktree — the skip must fire in the same pre-mirror scan as dedup
     bb = FakeBitbucket(fixture_repo, comments=MUTED_COMMENTS)
 
-    def boom(api_key):
+    def boom(api_key, base_url=None):
         raise AssertionError("make_client must not be called on a muted PR")
     monkeypatch.setattr("hone.review.make_client", boom)
 
@@ -168,7 +168,7 @@ def test_force_review_runs_despite_mute_and_dedup(tmp_path, fixture_repo,
 
     monkeypatch.setattr(
         "hone.review.make_client",
-        lambda api_key: FakeClientWrapper(_runnable_responses()))
+        lambda api_key, base_url=None: FakeClientWrapper(_runnable_responses()))
 
     from hone.repo import RepoManager
 
@@ -191,7 +191,7 @@ def test_dry_run_ignores_mute(tmp_path, fixture_repo, monkeypatch):
 
     monkeypatch.setattr(
         "hone.review.make_client",
-        lambda api_key: FakeClientWrapper(_runnable_responses()))
+        lambda api_key, base_url=None: FakeClientWrapper(_runnable_responses()))
 
     from hone.repo import RepoManager
 
@@ -230,7 +230,7 @@ def test_prior_reviews_flow_into_the_prompt(tmp_path, fixture_repo,
     ]
     monkeypatch.setattr(
         "hone.review.make_client",
-        lambda api_key: FakeClientWrapper(responses))
+        lambda api_key, base_url=None: FakeClientWrapper(responses))
 
     from hone.repo import RepoManager
 

@@ -7,7 +7,7 @@ from hone.server import CommandRequest, ReviewRequest
 
 def _settings(tmp_path, **overrides):
     base = dict(
-        synthetic_api_key="sk", synthetic_model="m", bitbucket_email="e",
+        llm_api_key="sk", llm_model="m", bitbucket_email="e",
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path / "data",
         tool_commands={"ruff": ("ruff", "check", ".")},
@@ -63,7 +63,7 @@ def test_github_repos_use_their_own_data_dir_subtree(tmp_path):
     # a repo with the same name under the same handle on both forges
     # (e.g. "technopoetic/hone" on both) must not collide on one mirror
     settings = Settings(
-        synthetic_api_key="sk", synthetic_model="m", bitbucket_email="e",
+        llm_api_key="sk", llm_model="m", bitbucket_email="e",
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
@@ -79,7 +79,7 @@ def test_build_process_runs_live_reviews(tmp_path, monkeypatch):
     # the serve seam: a ReviewRequest in, one live (never dry-run) run_review
     # out, with the job fields taken from settings, not the request
     settings = Settings(
-        synthetic_api_key="sk", synthetic_model="m", bitbucket_email="e",
+        llm_api_key="sk", llm_model="m", bitbucket_email="e",
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={"ruff": ("ruff", "check", ".")},
@@ -88,7 +88,7 @@ def test_build_process_runs_live_reviews(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_run_review(job, *, forge, repos, api_key):
+    def fake_run_review(job, *, forge, repos, api_key, base_url=None):
         calls.append((job, forge, repos, api_key))
         return "result"
 
@@ -111,7 +111,7 @@ def test_build_process_runs_live_reviews(tmp_path, monkeypatch):
 def test_build_process_passes_force_through(tmp_path, monkeypatch):
     # @hone review rides the same serve seam, but lands as a forced job
     settings = Settings(
-        synthetic_api_key="sk", synthetic_model="m", bitbucket_email="e",
+        llm_api_key="sk", llm_model="m", bitbucket_email="e",
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
@@ -132,7 +132,7 @@ def test_build_process_dispatches_on_req_forge(tmp_path, monkeypatch):
     # a multi-forge process must route each request to ITS forge's client
     # and repo manager, not always the first one configured
     settings = Settings(
-        synthetic_api_key="sk", synthetic_model="m", bitbucket_email="e",
+        llm_api_key="sk", llm_model="m", bitbucket_email="e",
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
@@ -177,7 +177,7 @@ def test_command_requests_post_marker_comments_and_never_review(
     # mute/unmute are deterministic state flips: one comment post, no LLM,
     # no mirror, no run_review
     settings = Settings(
-        synthetic_api_key="sk", synthetic_model="m", bitbucket_email="e",
+        llm_api_key="sk", llm_model="m", bitbucket_email="e",
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,

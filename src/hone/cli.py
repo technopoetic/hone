@@ -84,12 +84,13 @@ def build_process(settings: Settings, *, forges: dict[str, Forge],
             return
         job = ReviewJob(workspace=req.workspace, repo=req.repo,
                         pr_id=req.pr_id, dry_run=False, force=req.force,
-                        model=settings.synthetic_model,
+                        model=settings.llm_model,
                         static_checks=resolve_static_checks(
                             settings, req.repo),
                         max_turns=settings.max_turns)
         run_review(job, forge=forge, repos=repo_managers[req.forge],
-                   api_key=settings.synthetic_api_key)
+                   api_key=settings.llm_api_key,
+                   base_url=settings.llm_base_url)
 
     return process
 
@@ -210,12 +211,13 @@ def main(argv: list[str] | None = None) -> int:
     if removed:
         _log.info("swept %d stale worktree(s) from previous runs", removed)
     job = ReviewJob(workspace=namespace, repo=repo, pr_id=pr_id,
-                    dry_run=args.dry_run, model=settings.synthetic_model,
+                    dry_run=args.dry_run, model=settings.llm_model,
                     static_checks=resolve_static_checks(settings, repo),
                     max_turns=settings.max_turns)
     try:
         result = run_review(job, forge=forge, repos=repos,
-                            api_key=settings.synthetic_api_key)
+                            api_key=settings.llm_api_key,
+                            base_url=settings.llm_base_url)
     except Exception as e:  # fail open: log, exit nonzero, nothing posted
         print(f"review failed (nothing posted): {e}", file=sys.stderr)
         return 1
