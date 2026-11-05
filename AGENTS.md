@@ -121,7 +121,13 @@ alias, deploy path, pending rename runbook) lives in the gitignored
   `DEPLOY.local.md`.
 - **Spec:** `docs/prds/2026-09-17-pr-agent-design.md` (predates Phase 3/4;
   its own "Phases" section was never updated past Phase 2 — treat this
-  file as current, not that section).
+  file as current, not that section). A second spec is APPROVED but NOT
+  implemented: `docs/prds/2026-11-05-bitbucket-optional-design.md`
+  (Bitbucket demotes to an optional all-or-nothing forge group; renames
+  `HONE_WEBHOOK_SECRET` → `BITBUCKET_WEBHOOK_SECRET` and the route to
+  `/webhook/bitbucket`). Everything above still describes today's code —
+  its implementation is the step that rewrites this file's serve
+  invariant, so don't start it without going through the plan first.
 - **Phase 4 (GitHub done; Gitea not started):** `forge.py` holds the
   shared `PullRequest` + a `Forge` Protocol (structural, not an ABC — no
   inheritance exists elsewhere in this codebase); `bitbucket.py` and
