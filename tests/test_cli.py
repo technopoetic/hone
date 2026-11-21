@@ -12,25 +12,47 @@ def _settings(tmp_path, **overrides):
         bitbucket_workspace="ws", data_dir=tmp_path / "data",
         tool_commands={"ruff": ("ruff", "check", ".")},
         repo_checks={"repo": ("ruff",)},
-        max_turns=7, webhook_secret=None, port=8420)
+        max_turns=7, bitbucket_webhook_secret=None, port=8420)
     return Settings(**{**base, **overrides})
 
 
-def test_serve_without_webhook_secret_is_a_config_error(tmp_path, monkeypatch,
-                                                        capsys):
+def test_serve_without_bitbucket_webhook_secret_is_a_config_error(
+        tmp_path, monkeypatch, capsys):
     # serve's only mode is posting, so a missing secret is a startup config
     # error like any other: house error shape, exit 2, BEFORE logging/clients/
     # sweep leave side effects on a boot that can never proceed
-    monkeypatch.setattr("hone.cli.load_settings",
-                        lambda: _settings(tmp_path, webhook_secret=None))
+    monkeypatch.setattr(
+        "hone.cli.load_settings",
+        lambda: _settings(tmp_path, bitbucket_webhook_secret=None))
     monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
 
     rc = main(["serve"])
 
     assert rc == 2
-    assert "error: HONE_WEBHOOK_SECRET is required for serve" in (
+    assert "error: BITBUCKET_WEBHOOK_SECRET is required for serve" in (
         capsys.readouterr().err)
     # failed before any startup side effect: no log dir created
+    assert not (tmp_path / "data" / "logs").exists()
+
+
+def test_serve_github_only_without_secret_is_a_config_error(
+        tmp_path, monkeypatch, capsys):
+    # same refusal, symmetric: GitHub as the only enabled forge keeps its
+    # own specific error, not a Bitbucket-flavored one
+    monkeypatch.setattr(
+        "hone.cli.load_settings",
+        lambda: _settings(
+            tmp_path, bitbucket_email=None, bitbucket_username=None,
+            bitbucket_api_key=None, bitbucket_workspace=None,
+            github_token="tok", github_owner="octo-org",
+            github_webhook_secret=None))
+    monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
+
+    rc = main(["serve"])
+
+    assert rc == 2
+    assert "error: GITHUB_WEBHOOK_SECRET is required for serve" in (
+        capsys.readouterr().err)
     assert not (tmp_path / "data" / "logs").exists()
 
 
@@ -67,7 +89,7 @@ def test_github_repos_use_their_own_data_dir_subtree(tmp_path):
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
-        webhook_secret=None, port=8420, github_token="tok",
+        bitbucket_webhook_secret=None, port=8420, github_token="tok",
         github_owner="technopoetic")
 
     mgr = _github_repos(settings, tmp_path)
@@ -84,7 +106,7 @@ def test_build_process_runs_live_reviews(tmp_path, monkeypatch):
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={"ruff": ("ruff", "check", ".")},
         repo_checks={"repo": ("ruff",)},
-        max_turns=7, webhook_secret=None, port=8420)
+        max_turns=7, bitbucket_webhook_secret=None, port=8420)
 
     calls = []
 
@@ -115,7 +137,7 @@ def test_build_process_passes_force_through(tmp_path, monkeypatch):
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
-        webhook_secret=None, port=8420)
+        bitbucket_webhook_secret=None, port=8420)
     calls = []
 
     monkeypatch.setattr("hone.cli.run_review",
@@ -136,7 +158,7 @@ def test_build_process_dispatches_on_req_forge(tmp_path, monkeypatch):
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
-        webhook_secret=None, port=8420)
+        bitbucket_webhook_secret=None, port=8420)
 
     calls = []
     monkeypatch.setattr(
@@ -156,6 +178,24 @@ def test_build_process_dispatches_on_req_forge(tmp_path, monkeypatch):
 
     assert calls[0]["forge"] is gh and calls[0]["repos"] is gh_repos
     assert calls[1]["forge"] is bb and calls[1]["repos"] is bb_repos
+
+
+def test_review_bitbucket_url_requires_bitbucket_group(
+        tmp_path, monkeypatch, capsys):
+    # Bitbucket credentials are now optional, so reviewing a Bitbucket URL
+    # with no Bitbucket group must fail with a clear error (mirroring the
+    # GitHub gate), not a confusing downstream 401
+    monkeypatch.setattr(
+        "hone.cli.load_settings",
+        lambda: _settings(
+            tmp_path, bitbucket_email=None, bitbucket_username=None,
+            bitbucket_api_key=None, bitbucket_workspace=None,
+            github_token="gh", github_owner="octo-org"))
+    monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
+    rc = main([
+        "review", "https://bitbucket.org/ws/repo/pull-requests/7"])
+    assert rc == 2
+    assert "BITBUCKET_EMAIL" in capsys.readouterr().err
 
 
 def test_review_command_requires_github_config_for_github_url(
@@ -181,7 +221,7 @@ def test_command_requests_post_marker_comments_and_never_review(
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
-        webhook_secret=None, port=8420)
+        bitbucket_webhook_secret=None, port=8420)
 
     def boom(*args, **kwargs):
         raise AssertionError("run_review must not run for a command request")

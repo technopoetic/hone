@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 
-from .config import Settings
+from .config import ConfigError, Settings
 
 log = logging.getLogger("hone")
 
@@ -132,16 +132,23 @@ def _valid(secret: str, body: bytes, header: str | None) -> bool:
                                header.removeprefix("sha256=").encode())
 
 
-def create_app(secret: str, allowed_workspace: str,
-               enqueue: Callable[[ReviewRequest | CommandRequest], None],
-               *, github_secret: str | None = None,
-               github_owner: str | None = None) -> FastAPI:
+def create_app(
+    enqueue: Callable[[ReviewRequest | CommandRequest], None],
+    *,
+    bitbucket_secret: str | None = None,
+    bitbucket_workspace: str | None = None,
+    github_secret: str | None = None,
+    github_owner: str | None = None,
+    gitlab_signing_token: str | None = None,
+    gitlab_namespace: str | None = None,
+) -> FastAPI:
     """Build the webhook app. `enqueue` is injected so tests (and any
     future wiring) can swap the real queue for a sink of their choosing.
-    `/webhook` (Bitbucket) is always mounted. `/webhook/github` is mounted
-    only when both GitHub args are given — same "no entry = off" safe
-    default repos.toml already uses, rather than a route that exists but
-    can never validate anything."""
+    Each route mounts only when its forge's secret AND namespace arg are
+    both given — same "no entry = off" safe default repos.toml already
+    uses, rather than a route that exists but can never validate
+    anything. The gitlab args are the seam Task 6 wires the GitLab route
+    through; until then they are accepted but unused."""
     app = FastAPI()
 
     @app.get("/health")
@@ -149,49 +156,54 @@ def create_app(secret: str, allowed_workspace: str,
         # deployment convention: mekanik's staging health checks hit /health
         return PlainTextResponse('{"status":"ok"}')
 
-    @app.post("/webhook")
-    async def webhook(request: Request) -> PlainTextResponse:
-        # Signature is over the RAW bytes: read the body before parsing
-        # any JSON, or a parse/re-serialize gap could smuggle a different
-        # payload past the HMAC.
-        body = await request.body()
-        if not _valid(secret, body, request.headers.get("x-hub-signature")):
-            log.warning("webhook rejected: bad signature")
-            return PlainTextResponse("forbidden", status_code=403)
-        event = request.headers.get("x-event-key", "")
-        if event not in _ALL_EVENTS:
-            return PlainTextResponse("ignored", status_code=200)
-        try:
-            payload = await request.json()
-            workspace, _, slug = (
-                payload["repository"]["full_name"].partition("/"))
-            pr_id = payload["pullrequest"]["id"]
-        except (KeyError, TypeError, ValueError, AttributeError):
-            # Malformed JSON or a missing/mis-shaped repository/pullrequest
-            # from a signature holder is misconfiguration, not an attack to
-            # refuse — fail open with 200 so Bitbucket doesn't redeliver.
-            log.warning("unparseable webhook payload (event %r) ignored",
-                        event)
-            return PlainTextResponse("ignored", status_code=200)
-        if workspace != allowed_workspace:
-            # The payload names its own repo; pin it to ours or a forged
-            # payload could clone arbitrary repos with our credentials.
-            # Fail soft — a misconfigured webhook must not trip Bitbucket
-            # redelivery retries.
-            log.warning("webhook for foreign workspace %r ignored", workspace)
-            return PlainTextResponse("ignored", status_code=200)
-        if event == "pullrequest:comment_created":
-            command = _command_from_comment(payload, workspace=workspace,
-                                            repo=slug, pr_id=pr_id)
-            if command is None:
+    if bitbucket_secret and bitbucket_workspace:
+        @app.post("/webhook/bitbucket")
+        async def webhook_bitbucket(request: Request) -> PlainTextResponse:
+            # Signature is over the RAW bytes: read the body before parsing
+            # any JSON, or a parse/re-serialize gap could smuggle a different
+            # payload past the HMAC.
+            body = await request.body()
+            if not _valid(bitbucket_secret, body,
+                          request.headers.get("x-hub-signature")):
+                log.warning("webhook rejected: bad signature")
+                return PlainTextResponse("forbidden", status_code=403)
+            event = request.headers.get("x-event-key", "")
+            if event not in _ALL_EVENTS:
                 return PlainTextResponse("ignored", status_code=200)
-            enqueue(command)
+            try:
+                payload = await request.json()
+                workspace, _, slug = (
+                    payload["repository"]["full_name"].partition("/"))
+                pr_id = payload["pullrequest"]["id"]
+            except (KeyError, TypeError, ValueError, AttributeError):
+                # Malformed JSON or a missing/mis-shaped repository/pullrequest
+                # from a signature holder is misconfiguration, not an attack
+                # to refuse — fail open with 200 so Bitbucket doesn't redeliver.
+                log.warning("unparseable webhook payload (event %r) ignored",
+                            event)
+                return PlainTextResponse("ignored", status_code=200)
+            if workspace != bitbucket_workspace:
+                # The payload names its own repo; pin it to ours or a forged
+                # payload could clone arbitrary repos with our credentials.
+                # Fail soft — a misconfigured webhook must not trip Bitbucket
+                # redelivery retries.
+                log.warning("webhook for foreign workspace %r ignored",
+                            workspace)
+                return PlainTextResponse("ignored", status_code=200)
+            if event == "pullrequest:comment_created":
+                command = _command_from_comment(payload, workspace=workspace,
+                                                repo=slug, pr_id=pr_id)
+                if command is None:
+                    return PlainTextResponse("ignored", status_code=200)
+                enqueue(command)
+                return PlainTextResponse("queued", status_code=200)
+            # Deliberately outside the shape guard: an enqueue failure
+            # (bounded or disk-backed queue in a future phase) deserves a
+            # real 500 so Bitbucket redelivers, and must not be mislabeled
+            # as unparseable.
+            enqueue(ReviewRequest(workspace=workspace, repo=slug,
+                                  pr_id=pr_id))
             return PlainTextResponse("queued", status_code=200)
-        # Deliberately outside the shape guard: an enqueue failure (bounded
-        # or disk-backed queue in a future phase) deserves a real 500 so
-        # Bitbucket redelivers, and must not be mislabeled as unparseable.
-        enqueue(ReviewRequest(workspace=workspace, repo=slug, pr_id=pr_id))
-        return PlainTextResponse("queued", status_code=200)
 
     if github_secret and github_owner:
         @app.post("/webhook/github")
@@ -255,6 +267,50 @@ def create_app(secret: str, allowed_workspace: str,
     return app
 
 
+def validate_serve_webhooks(settings: Settings) -> list[str]:
+    """Return missing secrets when at least one forge can still mount.
+
+    Raises ConfigError when no enabled forge has a usable secret: a
+    single enabled forge keeps its specific error, while several enabled
+    forges with none usable get one message naming every missing variable
+    in configured order (bitbucket, github, gitlab)."""
+    configured = [
+        (bool(settings.bitbucket_api_key),
+         bool(settings.bitbucket_webhook_secret),
+         "BITBUCKET_WEBHOOK_SECRET"),
+        (bool(settings.github_token),
+         bool(settings.github_webhook_secret),
+         "GITHUB_WEBHOOK_SECRET"),
+        (bool(settings.gitlab_token),
+         bool(settings.gitlab_webhook_signing_token),
+         "GITLAB_WEBHOOK_SIGNING_TOKEN"),
+    ]
+    enabled = [entry for entry in configured if entry[0]]
+    missing = [env for _, has_secret, env in enabled if not has_secret]
+    if not enabled or len(missing) == len(enabled):
+        if len(enabled) == 1:
+            message = f"{missing[0]} is required for serve"
+        elif missing:
+            message = ("no forge has a webhook secret configured for "
+                       "serve: " + ", ".join(missing))
+        else:
+            # only reachable from direct calls: load_settings already
+            # refuses an environment with no forge credentials at all
+            message = "no forge has a webhook secret configured for serve"
+        raise ConfigError(message)
+    return missing
+
+
+# Each missing secret means exactly this route stays unmounted — used by
+# serve to name it in the startup warning. The GitLab entry names the
+# route Task 6 wires in.
+_UNMOUNTED_ROUTES = {
+    "BITBUCKET_WEBHOOK_SECRET": "/webhook/bitbucket",
+    "GITHUB_WEBHOOK_SECRET": "/webhook/github",
+    "GITLAB_WEBHOOK_SIGNING_TOKEN": "/webhook/gitlab",
+}
+
+
 def run_worker(q: queue.Queue[ReviewRequest | CommandRequest | None],
                process: Callable[[ReviewRequest | CommandRequest], None]
                ) -> None:
@@ -283,29 +339,36 @@ def serve(settings: Settings, *,
     Logging is the caller's job: configure_logging() is not idempotent
     (a second call stacks duplicate root handlers), so serve() never
     calls it — call it exactly once before serve() if file logging is
-    wanted. Raises SystemExit when no webhook secret is configured: a
-    server that accepts unsigned webhooks is not a mode, it's a hole.
+    wanted. Raises SystemExit when no enabled forge has a usable webhook
+    secret: a server that accepts unsigned webhooks is not a mode, it's
+    a hole. Enabled forges missing only their secret keep the server up
+    with their route unmounted (one warning each, naming the route).
     """
     import uvicorn
 
-    if not settings.webhook_secret:
-        raise SystemExit("HONE_WEBHOOK_SECRET is required for serve")
-    # GitHub is optional even when configured for the CLI: a missing
-    # webhook secret must only disable the GitHub route, never refuse to
-    # start the whole server (which still has to serve Bitbucket).
-    github_secret = settings.github_webhook_secret
-    github_owner = settings.github_owner
-    if settings.github_token and not github_secret:
-        log.warning("GITHUB_TOKEN is set but GITHUB_WEBHOOK_SECRET is not — "
-                    "/webhook/github will not be mounted")
-        github_secret = github_owner = None
+    try:
+        missing = validate_serve_webhooks(settings)
+    except ConfigError as error:
+        raise SystemExit(str(error))
+    for env in missing:
+        log.warning("%s is not set — %s will not be mounted",
+                    env, _UNMOUNTED_ROUTES[env])
     q: queue.Queue[ReviewRequest | CommandRequest | None] = queue.Queue()
     threading.Thread(target=run_worker, args=(q, process_factory()),
                      daemon=True).start()
-    app = create_app(settings.webhook_secret,
-                     allowed_workspace=settings.bitbucket_workspace,
-                     enqueue=q.put, github_secret=github_secret,
-                     github_owner=github_owner)
+    # Mount a route only for a forge with both credentials and a secret:
+    # a route that could never validate anything is worse than a 404.
+    app = create_app(
+        q.put,
+        bitbucket_secret=(settings.bitbucket_webhook_secret
+                          if settings.bitbucket_api_key else None),
+        bitbucket_workspace=settings.bitbucket_workspace,
+        github_secret=(settings.github_webhook_secret
+                        if settings.github_token else None),
+        github_owner=settings.github_owner,
+        gitlab_signing_token=None,  # the GitLab route is wired in Task 6
+        gitlab_namespace=settings.gitlab_namespace,
+    )
     # Loopback only: nginx fronts this as the public edge on the droplet.
     # Binding a routable interface would expose the raw port — no body
     # limits in front of a handler that buffers request.body() before

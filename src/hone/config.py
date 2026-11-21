@@ -37,14 +37,16 @@ class Settings:
     # unknown repos default to safe (nothing), not to Mekanik's Python tools.
     repo_checks: dict[str, tuple[str, ...]] = field(default_factory=dict)
     max_turns: int = 15
-    # Optional at load time — `serve` refuses to start without setting it
-    # itself, keeping the CLI usable without a webhook secret.
-    webhook_secret: str | None = None
+    # Bitbucket webhook secret, optional at load time — `serve` refuses to
+    # start without it, keeping the CLI usable without a webhook secret
+    # (same deferred pattern as github_webhook_secret below).
+    bitbucket_webhook_secret: str | None = None
     port: int = 8420
     # GitHub support is all-or-nothing-but-optional: both set, or both
     # unset — see load_settings. github_webhook_secret is checked only at
-    # serve-time (same deferred pattern as webhook_secret above), so the
-    # CLI `review` path works against a GitHub PR with no secret at all.
+    # serve-time (same deferred pattern as bitbucket_webhook_secret
+    # above), so the CLI `review` path works against a GitHub PR with no
+    # secret at all.
     github_token: str | None = None
     github_owner: str | None = None
     github_webhook_secret: str | None = None
@@ -63,7 +65,10 @@ class Settings:
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
     """Build Settings from a mapping (tests inject; production passes None
-    to read os.environ). Raises ConfigError listing every missing var."""
+    to read os.environ). Two distinct error shapes: missing LLM-required
+    variables raise ONE aggregated ConfigError naming every gap, while
+    per-forge problems (a partial group, no forge at all, a bad
+    GITLAB_URL) each raise their own specific ConfigError."""
     source = os.environ if env is None else env
 
     required = {
@@ -104,9 +109,8 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         tool_commands=tool_commands,
         repo_checks=repo_checks,
         max_turns=int(source.get("HONE_MAX_TURNS", "15")),
-        # Legacy name: the Bitbucket webhook secret. Task 2 renames this to
-        # bitbucket_webhook_secret; kept here so serve/cli keep working.
-        webhook_secret=source.get("HONE_WEBHOOK_SECRET") or None,
+        bitbucket_webhook_secret=(
+            source.get("BITBUCKET_WEBHOOK_SECRET") or None),
         port=int(source.get("HONE_PORT", "8420")),
         github_token=github[0],
         github_owner=github[1],
@@ -146,11 +150,17 @@ def _normalize_gitlab_url(raw_url):
     url = raw_url.rstrip("/")
     try:
         parsed = urlsplit(url)
+        # urlsplit defers port parsing: a non-numeric port (e.g. ":abc")
+        # raises ValueError only when .port is accessed. Touch it here,
+        # inside the guard, so this except converts it to ConfigError like
+        # any other unusable base instead of letting it pass validation.
+        port = parsed.port
         valid = (
             parsed.scheme in {"http", "https"}
             and parsed.hostname is not None
             and parsed.username is None
             and parsed.password is None
+            and isinstance(port, int | None)
             and not parsed.query
             and not parsed.fragment
         )

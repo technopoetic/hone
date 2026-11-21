@@ -24,7 +24,12 @@ from .github import GitHubClient
 from .markers import control_comment
 from .repo import RepoManager
 from .review import ReviewJob, run_review
-from .server import CommandRequest, ReviewRequest, serve
+from .server import (
+    CommandRequest,
+    ReviewRequest,
+    serve,
+    validate_serve_webhooks,
+)
 
 _log = logging.getLogger("hone")
 
@@ -98,37 +103,40 @@ def build_process(settings: Settings, *, forges: dict[str, Forge],
 def _serve() -> int:
     try:
         settings = load_settings()
+        # Serve is live-only: with no enabled forge holding a usable
+        # webhook secret it could never post and would only accept
+        # unsigned webhooks — refuse as a config error, in the house
+        # error shape, BEFORE logging/clients/sweep leave side effects on
+        # a boot that cannot proceed. serve()'s own validation stays as
+        # defense in depth.
+        validate_serve_webhooks(settings)
     except ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 2
-
-    # Serve is live-only: without the webhook secret it could never post and
-    # would only accept unsigned webhooks — refuse as a config error, in the
-    # house error shape, BEFORE logging/clients/sweep leave side effects on a
-    # boot that cannot proceed. serve()'s own check stays as defense in depth.
-    if not settings.webhook_secret:
-        print("error: HONE_WEBHOOK_SECRET is required for serve",
-              file=sys.stderr)
         return 2
 
     # configure_logging is not idempotent — call exactly once per process.
     log_path = configure_logging(settings.data_dir)
     _log.info("logging to %s", log_path)
 
-    # No URL to parse a workspace from on this path: the server is pinned
-    # to the configured workspace (the route rejects any other), so the
-    # client is pinned to it too.
-    bitbucket = BitbucketClient(email=settings.bitbucket_email,
-                                api_key=settings.bitbucket_api_key,
-                                workspace=settings.bitbucket_workspace)
-    repos = RepoManager(data_dir=settings.data_dir,
-                        username=settings.bitbucket_username,
-                        api_key=settings.bitbucket_api_key)
-    forges: dict[str, Forge] = {"bitbucket": bitbucket}
-    repo_managers: dict[str, RepoManager] = {"bitbucket": repos}
+    # Only enabled forges get clients: a disabled forge's route is never
+    # mounted (see serve), so a client for it could never receive a job.
+    forges: dict[str, Forge] = {}
+    repo_managers: dict[str, RepoManager] = {}
+    if settings.bitbucket_api_key:
+        # No URL to parse a workspace from on this path: the server is
+        # pinned to the configured workspace (the route rejects any
+        # other), so the client is pinned to it too.
+        forges["bitbucket"] = BitbucketClient(
+            email=settings.bitbucket_email,
+            api_key=settings.bitbucket_api_key,
+            workspace=settings.bitbucket_workspace)
+        repo_managers["bitbucket"] = RepoManager(
+            data_dir=settings.data_dir,
+            username=settings.bitbucket_username,
+            api_key=settings.bitbucket_api_key)
     if settings.github_token:
         forges["github"] = GitHubClient(token=settings.github_token,
-                                        owner=settings.github_owner)
+                                         owner=settings.github_owner)
         repo_managers["github"] = _github_repos(settings, settings.data_dir)
 
     # One sweep per boot: the only safe moment is process start, before the
@@ -181,6 +189,14 @@ def main(argv: list[str] | None = None) -> int:
     if forge_name == "github" and not settings.github_token:
         print("error: GITHUB_TOKEN and GITHUB_OWNER are required to "
               "review a GitHub PR", file=sys.stderr)
+        return 2
+    if forge_name == "bitbucket" and not settings.bitbucket_api_key:
+        # bitbucket credentials are optional now; a Bitbucket URL with no
+        # Bitbucket group must fail like the GitHub gate above, not with
+        # a confusing downstream 401
+        print("error: BITBUCKET_EMAIL, BITBUCKET_API_KEY, and "
+              "BITBUCKET_WORKSPACE are required to review a Bitbucket PR",
+              file=sys.stderr)
         return 2
 
     # Same INFO stream to the console as before, plus a rotating file under

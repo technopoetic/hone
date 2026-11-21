@@ -128,6 +128,7 @@ def test_partial_forge_group_is_a_config_error(partial):
     "https://user:secret@git.example.com",
     "https://git.example.com?x=1",
     "https://git.example.com#fragment",
+    "https://git.example.com:abc",
 ])
 def test_gitlab_url_rejects_credentials_and_malformed_bases(url):
     with pytest.raises(ConfigError, match="GITLAB_URL"):
@@ -180,18 +181,25 @@ def test_resolve_static_checks_scopes_to_one_repo():
     assert resolve_static_checks(s, "unlisted-repo") == {}
 
 
-def test_webhook_settings_default(monkeypatch, tmp_path):
+def test_bitbucket_webhook_secret_defaults_to_unconfigured(
+        monkeypatch, tmp_path):
+    # optional until serve runs — the CLI `review` path works without it
     monkeypatch.chdir(tmp_path)
     s = load_settings(FULL_ENV)
-    assert s.webhook_secret is None          # optional until serve runs
+    assert s.bitbucket_webhook_secret is None
     assert s.port == 8420
 
 
-def test_webhook_settings_from_env(monkeypatch, tmp_path):
+def test_bitbucket_webhook_secret_uses_forge_name(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    s = load_settings({**FULL_ENV, "HONE_WEBHOOK_SECRET": "s3cr3t",
-                       "HONE_PORT": "9000"})
-    assert s.webhook_secret == "s3cr3t"
+    settings = load_settings({**FULL_ENV,
+                              "BITBUCKET_WEBHOOK_SECRET": "bb-secret"})
+    assert settings.bitbucket_webhook_secret == "bb-secret"
+
+
+def test_port_from_env(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    s = load_settings({**FULL_ENV, "HONE_PORT": "9000"})
     assert s.port == 9000
 
 

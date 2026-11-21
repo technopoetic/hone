@@ -26,7 +26,8 @@ def sign(body: bytes, secret: str) -> str:
 def receiver():
     """App plus the list its enqueue lands in — list.append as the queue."""
     queued: list[ReviewRequest] = []
-    app = create_app(secret=SECRET, allowed_workspace="hmdatasolutions",
+    app = create_app(bitbucket_secret=SECRET,
+                     bitbucket_workspace="hmdatasolutions",
                      enqueue=queued.append)
     return TestClient(app), queued
 
@@ -36,7 +37,7 @@ def post(client: TestClient, body: bytes, *, signature: str | None = None,
     headers = {"X-Event-Key": event}
     if signature is not None:
         headers["X-Hub-Signature"] = signature
-    return client.post("/webhook", content=body, headers=headers)
+    return client.post("/webhook/bitbucket", content=body, headers=headers)
 
 
 def test_missing_signature_is_forbidden(receiver):
@@ -257,10 +258,11 @@ def test_non_ascii_signature_header_is_forbidden():
     # instead of the spec's plain 403 for malformed signatures. Sent as raw
     # bytes here because httpx would refuse the str client-side (ascii).
     queued: list[ReviewRequest] = []
-    app = create_app(secret=SECRET, allowed_workspace="hmdatasolutions",
+    app = create_app(bitbucket_secret=SECRET,
+                     bitbucket_workspace="hmdatasolutions",
                      enqueue=queued.append)
     client = TestClient(app, raise_server_exceptions=False)
-    r = client.post("/webhook", content=json.dumps(PAYLOAD).encode(),
+    r = client.post("/webhook/bitbucket", content=json.dumps(PAYLOAD).encode(),
                     headers={"X-Hub-Signature":
                              b"sha256=" + "é".encode("latin-1") * 64,
                              "X-Event-Key": "pullrequest:created"})
@@ -293,7 +295,8 @@ def test_enqueue_failure_propagates_as_500(caplog):
         calls.append(req)
         raise ValueError("queue write failed")
 
-    app = create_app(secret=SECRET, allowed_workspace="hmdatasolutions",
+    app = create_app(bitbucket_secret=SECRET,
+                     bitbucket_workspace="hmdatasolutions",
                      enqueue=full_queue)
     client = TestClient(app, raise_server_exceptions=False)
     body = json.dumps(PAYLOAD).encode()
@@ -329,6 +332,84 @@ def test_worker_survives_failure_and_runs_next_job():
     assert not worker.is_alive()
 
 
+def make_serve_settings(forge, *, with_secret):
+    settings = SimpleNamespace(
+        bitbucket_api_key=None, bitbucket_webhook_secret=None,
+        bitbucket_workspace="ws", github_token=None, github_owner="octo",
+        github_webhook_secret=None, gitlab_token=None,
+        gitlab_url="https://gitlab.com", gitlab_namespace="engineering",
+        gitlab_webhook_signing_token=None, port=8420)
+    credential = {
+        "bitbucket": "bitbucket_api_key",
+        "github": "github_token",
+        "gitlab": "gitlab_token",
+    }[forge]
+    secret = {
+        "bitbucket": "bitbucket_webhook_secret",
+        "github": "github_webhook_secret",
+        "gitlab": "gitlab_webhook_signing_token",
+    }[forge]
+    setattr(settings, credential, "token")
+    if with_secret:
+        setattr(settings, secret, "secret")
+    return settings
+
+
+def test_bitbucket_route_is_absent_when_not_configured():
+    # create_app without bitbucket_secret/bitbucket_workspace: the route
+    # doesn't exist at all, not merely unauthorized — 404, not 403.
+    queued = []
+    app = create_app(enqueue=queued.append)
+    client = TestClient(app)
+    assert client.get("/health").status_code == 200
+    assert client.post("/webhook/bitbucket", content=b"{}").status_code == 404
+
+
+@pytest.mark.parametrize("forge,missing_env", [
+    ("bitbucket", "BITBUCKET_WEBHOOK_SECRET"),
+    ("github", "GITHUB_WEBHOOK_SECRET"),
+    ("gitlab", "GITLAB_WEBHOOK_SIGNING_TOKEN"),
+])
+def test_single_forge_without_secret_refuses(
+        forge, missing_env, monkeypatch):
+    # one enabled forge, no secret: nothing can mount, so refuse to serve
+    # with that forge's specific variable — never bind an unsigned port
+    def fail_run(*args, **kwargs):
+        raise AssertionError("server must not bind")
+
+    monkeypatch.setattr("uvicorn.run", fail_run)
+    settings = make_serve_settings(forge, with_secret=False)
+    with pytest.raises(SystemExit, match=missing_env):
+        serve(settings, process_factory=lambda: lambda req: None)
+
+
+def test_all_secrets_missing_names_every_variable_in_configured_order(
+        monkeypatch):
+    # several enabled forges, no usable secret between them: the error
+    # must name every missing variable, ordered bitbucket, github, gitlab
+    settings = make_serve_settings("bitbucket", with_secret=False)
+    settings.github_token = "gh-token"
+    with pytest.raises(SystemExit) as exc:
+        serve(settings, process_factory=lambda: lambda req: None)
+    message = str(exc.value)
+    assert "BITBUCKET_WEBHOOK_SECRET" in message
+    assert "GITHUB_WEBHOOK_SECRET" in message
+    assert (message.index("BITBUCKET_WEBHOOK_SECRET")
+            < message.index("GITHUB_WEBHOOK_SECRET"))
+
+
+def test_healthy_forge_warns_and_serves_when_other_secrets_are_missing(
+        monkeypatch, caplog):
+    settings = make_serve_settings("bitbucket", with_secret=True)
+    settings.github_token = "gh-token"
+    settings.gitlab_token = "gl-token"
+    caplog.set_level("WARNING", logger="hone")
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    serve(settings, process_factory=lambda: lambda req: None)
+    assert "GITHUB_WEBHOOK_SECRET" in caplog.text
+    assert "GITLAB_WEBHOOK_SIGNING_TOKEN" in caplog.text
+
+
 def test_serve_binds_loopback_only(monkeypatch):
     # nginx is the public edge; the raw port must not be reachable from
     # outside, or request.body()-buffered traffic bypasses nginx's body
@@ -339,22 +420,10 @@ def test_serve_binds_loopback_only(monkeypatch):
         captured.update(kwargs)
 
     monkeypatch.setattr("uvicorn.run", fake_run)
-    settings = SimpleNamespace(webhook_secret=SECRET,
-                               bitbucket_workspace="hmdatasolutions",
-                               port=8420, github_token=None,
-                               github_owner=None, github_webhook_secret=None)
+    settings = make_serve_settings("bitbucket", with_secret=True)
     serve(settings, process_factory=lambda: lambda req: None)
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == settings.port
-
-
-def test_serve_refuses_to_start_without_secret():
-    settings = SimpleNamespace(webhook_secret=None,
-                               bitbucket_workspace="hmdatasolutions",
-                               port=8420, github_token=None,
-                               github_owner=None, github_webhook_secret=None)
-    with pytest.raises(SystemExit):
-        serve(settings, process_factory=lambda: lambda req: None)
 
 
 def test_health_endpoint_answers_unauthenticated(receiver):
@@ -374,7 +443,8 @@ GITHUB_OWNER = "technopoetic"
 @pytest.fixture
 def github_receiver():
     queued: list[ReviewRequest | CommandRequest] = []
-    app = create_app(secret=SECRET, allowed_workspace="hmdatasolutions",
+    app = create_app(bitbucket_secret=SECRET,
+                     bitbucket_workspace="hmdatasolutions",
                      enqueue=queued.append, github_secret=GITHUB_SECRET,
                      github_owner=GITHUB_OWNER)
     return TestClient(app), queued
