@@ -21,6 +21,7 @@ from .config import (
 )
 from .forge import Forge
 from .github import GitHubClient
+from .gitlab import GitLabClient
 from .markers import control_comment
 from .repo import RepoManager
 from .review import ReviewJob, run_review
@@ -39,9 +40,17 @@ _GITHUB_PR_URL = re.compile(
     r"https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 
 
-def parse_pr_url(url: str) -> tuple[str, str, str, int]:
+def parse_pr_url(url: str, gitlab_url: str | None = None
+                 ) -> tuple[str, str, str, int]:
     """(forge, namespace, repo, pr_id). `namespace` is Bitbucket's
-    workspace or GitHub's owner — same role, different forge's word."""
+    workspace, GitHub's owner, or GitLab's (possibly nested) group path —
+    same role, different forge's word.
+
+    GitLab recognition requires the CONFIGURED base URL: an
+    arbitrary/unconfigured GitLab-shaped host is not a supported URL.
+    The dynamic pattern is an exact full match, so a lookalike base path
+    (`gitlab-evil` vs `gitlab`), a `..` namespace segment, or an extra
+    suffix after the MR number all fall through to the ValueError."""
     url = url.strip()
     m = _BITBUCKET_PR_URL.fullmatch(url)
     if m:
@@ -49,7 +58,38 @@ def parse_pr_url(url: str) -> tuple[str, str, str, int]:
     m = _GITHUB_PR_URL.fullmatch(url)
     if m:
         return "github", m.group(1), m.group(2), int(m.group(3))
-    raise ValueError(f"not a Bitbucket or GitHub PR URL: {url}")
+    if gitlab_url:
+        pattern = (
+            re.escape(gitlab_url.rstrip("/"))
+            + r"/(.+)/([^/]+)/-/merge_requests/(\d+)")
+        m = re.fullmatch(pattern, url)
+        if m:
+            namespace = m.group(1)
+            segments = namespace.split("/")
+            if all(segment not in {"", ".", ".."} for segment in segments):
+                return "gitlab", namespace, m.group(2), int(m.group(3))
+    raise ValueError(
+        f"not a supported Bitbucket, GitHub, or GitLab URL: {url}")
+
+
+def _gitlab_repos(settings: Settings, data_dir) -> RepoManager:
+    # Own data_dir subtree, same collision argument as _github_repos
+    # below: mirrors are keyed only by namespace/repo (repo.py), so a
+    # repo with the same name under the same handle on two forges would
+    # otherwise collide on one mirror and fetch from the wrong remote.
+    #
+    # gitlab_url keeps its normalized form (trailing slash stripped, and
+    # self-managed path prefixes kept), so plain concatenation builds the
+    # clone URL; nested namespaces are fine as path material since
+    # RepoManager confines paths under its data_dir.
+    #
+    # GitLab's documented convention for PAT-over-git-HTTPS: username
+    # "oauth2", the token as the password.
+    return RepoManager(
+        data_dir=data_dir / "gitlab", username="oauth2",
+        api_key=settings.gitlab_token,
+        remote_url_for=lambda namespace, repo: (
+            f"{settings.gitlab_url}/{namespace}/{repo}.git"))
 
 
 def _github_repos(settings: Settings, data_dir) -> RepoManager:
@@ -138,6 +178,17 @@ def _serve() -> int:
         forges["github"] = GitHubClient(token=settings.github_token,
                                          owner=settings.github_owner)
         repo_managers["github"] = _github_repos(settings, settings.data_dir)
+    if settings.gitlab_token:
+        # Pinned to the CONFIGURED namespace like the Bitbucket client
+        # above: the server has no URL to parse one from, and the GitLab
+        # route that lands in Task 6 is pinned to the same namespace. The
+        # mirror manager gets the isolated gitlab subtree (see
+        # _gitlab_repos) and therefore its own sweep in the loop below.
+        forges["gitlab"] = GitLabClient(
+            token=settings.gitlab_token,
+            base_url=settings.gitlab_url,
+            namespace=settings.gitlab_namespace)
+        repo_managers["gitlab"] = _gitlab_repos(settings, settings.data_dir)
 
     # One sweep per boot: the only safe moment is process start, before the
     # worker can be mid-review. Best-effort: cleanup failing must warn,
@@ -163,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(
         prog="hone",
-        description="Autonomous PR review agent (Bitbucket, GitHub)")
+        description="Autonomous PR review agent (Bitbucket, GitHub, GitLab)")
     sub = parser.add_subparsers(dest="command", required=True)
     rev = sub.add_parser("review", help="review one pull request")
     rev.add_argument("url", help="full URL of the pull request")
@@ -176,14 +227,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         return _serve()
 
-    try:
-        forge_name, namespace, repo, pr_id = parse_pr_url(args.url)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
+    # Settings load BEFORE the URL parses: GitLab recognition is tied to
+    # the configured base URL (settings.gitlab_url), so the URL alone
+    # cannot decide the forge anymore.
     try:
         settings = load_settings()
     except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    try:
+        forge_name, namespace, repo, pr_id = parse_pr_url(
+            args.url, gitlab_url=settings.gitlab_url)
+    except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     if forge_name == "github" and not settings.github_token:
@@ -198,6 +253,12 @@ def main(argv: list[str] | None = None) -> int:
               "BITBUCKET_WORKSPACE are required to review a Bitbucket PR",
               file=sys.stderr)
         return 2
+    if forge_name == "gitlab" and not settings.gitlab_token:
+        # defensive: load_settings already refuses a partial GitLab
+        # group, so this only fires for directly-constructed Settings
+        print("error: GITLAB_TOKEN, GITLAB_URL, and GITLAB_NAMESPACE are "
+              "required to review a GitLab merge request", file=sys.stderr)
+        return 2
 
     # Same INFO stream to the console as before, plus a rotating file under
     # data_dir/logs so unattended serve runs leave an audit trail.
@@ -208,6 +269,14 @@ def main(argv: list[str] | None = None) -> int:
         forge: Forge = GitHubClient(token=settings.github_token,
                                     owner=namespace)
         repos = _github_repos(settings, settings.data_dir)
+    elif forge_name == "gitlab":
+        # Like the GitHub branch: the client is pinned to the URL's
+        # parsed namespace (which may nest, group/sub), and mirrors live
+        # in the isolated gitlab subtree.
+        forge = GitLabClient(token=settings.gitlab_token,
+                             base_url=settings.gitlab_url,
+                             namespace=namespace)
+        repos = _gitlab_repos(settings, settings.data_dir)
     else:
         forge = BitbucketClient(email=settings.bitbucket_email,
                                 api_key=settings.bitbucket_api_key,
