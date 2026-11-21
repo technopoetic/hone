@@ -21,10 +21,13 @@ class ConfigError(RuntimeError):
 class Settings:
     llm_api_key: str
     llm_model: str
-    bitbucket_email: str
-    bitbucket_username: str  # git-over-HTTPS needs username, not email
-    bitbucket_api_key: str
-    bitbucket_workspace: str
+    # Every forge group is optional: credentials may be all-set or all-unset,
+    # and at least one forge must be configured (see load_settings). Bitbucket
+    # values are None on deployments that only run GitHub or GitLab.
+    bitbucket_email: str | None
+    bitbucket_username: str | None  # git-over-HTTPS needs username, not email
+    bitbucket_api_key: str | None
+    bitbucket_workspace: str | None
     data_dir: Path
     # Tool registry (name -> argv) from repos.toml. A tool with no `command`
     # (value is None) is a builtin resolved in tools.py — see eslint, which
@@ -45,6 +48,13 @@ class Settings:
     github_token: str | None = None
     github_owner: str | None = None
     github_webhook_secret: str | None = None
+    # GitLab support, same all-or-nothing-but-optional shape as GitHub.
+    # gitlab_url is a normalized http(s) base (trailing slash stripped);
+    # self-managed hosts carry a path prefix, so keep the path.
+    gitlab_token: str | None = None
+    gitlab_url: str | None = None
+    gitlab_namespace: str | None = None
+    gitlab_webhook_signing_token: str | None = None
     # None = talk to Anthropic's own API directly (the SDK's default).
     # Set to point at any Anthropic-Messages-API-compatible endpoint —
     # Synthetic.new, a self-hosted proxy, etc.
@@ -59,23 +69,23 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     required = {
         "LLM_API_KEY": source.get("LLM_API_KEY"),
         "LLM_MODEL": source.get("LLM_MODEL"),
-        "BITBUCKET_EMAIL": source.get("BITBUCKET_EMAIL"),
-        "BITBUCKET_API_KEY": source.get("BITBUCKET_API_KEY"),
-        "BITBUCKET_WORKSPACE": source.get("BITBUCKET_WORKSPACE"),
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise ConfigError("Missing required env vars: " + ", ".join(missing))
 
-    # GitHub is optional, but all-or-nothing: partial config is almost
-    # certainly a typo, not an intentional half-setup, so fail fast rather
-    # than silently treating GitHub as unconfigured.
-    github_token = source.get("GITHUB_TOKEN") or None
-    github_owner = source.get("GITHUB_OWNER") or None
-    if bool(github_token) != bool(github_owner):
+    bitbucket = _forge_group(source, [
+        "BITBUCKET_EMAIL", "BITBUCKET_API_KEY", "BITBUCKET_WORKSPACE"])
+    github = _forge_group(source, ["GITHUB_TOKEN", "GITHUB_OWNER"])
+    gitlab = _forge_group(source, [
+        "GITLAB_TOKEN", "GITLAB_URL", "GITLAB_NAMESPACE"])
+    if not any(map(all, (bitbucket, github, gitlab))):
         raise ConfigError(
-            "GITHUB_TOKEN and GITHUB_OWNER must be set together "
-            "(or both left unset to disable GitHub support)")
+            "no forge configured: set Bitbucket, GitHub, and/or GitLab "
+            "credentials")
+    gitlab_token, raw_gitlab_url, gitlab_namespace = gitlab
+    gitlab_url = (_normalize_gitlab_url(raw_gitlab_url)
+                  if raw_gitlab_url else None)
 
     repo_config_path = Path(source.get("HONE_REPO_CONFIG", "repos.toml"))
     tool_commands, repo_checks = load_repo_config(repo_config_path)
@@ -84,23 +94,73 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         llm_api_key=required["LLM_API_KEY"],
         llm_model=required["LLM_MODEL"],
         llm_base_url=source.get("LLM_BASE_URL") or None,
-        bitbucket_email=required["BITBUCKET_EMAIL"],
-        bitbucket_username=(source.get("BITBUCKET_USERNAME")
-                            or required["BITBUCKET_EMAIL"]),
-        bitbucket_api_key=required["BITBUCKET_API_KEY"],
-        bitbucket_workspace=required["BITBUCKET_WORKSPACE"],
+        bitbucket_email=bitbucket[0],
+        bitbucket_username=(source.get("BITBUCKET_USERNAME") or bitbucket[0]),
+        bitbucket_api_key=bitbucket[1],
+        bitbucket_workspace=bitbucket[2],
         data_dir=Path(
             source.get("HONE_DATA_DIR", str(Path.home() / ".local/share/hone"))
         ).expanduser(),
         tool_commands=tool_commands,
         repo_checks=repo_checks,
         max_turns=int(source.get("HONE_MAX_TURNS", "15")),
+        # Legacy name: the Bitbucket webhook secret. Task 2 renames this to
+        # bitbucket_webhook_secret; kept here so serve/cli keep working.
         webhook_secret=source.get("HONE_WEBHOOK_SECRET") or None,
         port=int(source.get("HONE_PORT", "8420")),
-        github_token=github_token,
-        github_owner=github_owner,
+        github_token=github[0],
+        github_owner=github[1],
         github_webhook_secret=source.get("GITHUB_WEBHOOK_SECRET") or None,
+        gitlab_token=gitlab_token,
+        gitlab_url=gitlab_url,
+        gitlab_namespace=gitlab_namespace,
+        gitlab_webhook_signing_token=(
+            source.get("GITLAB_WEBHOOK_SIGNING_TOKEN") or None),
     )
+
+
+def _forge_group(source, names):
+    """One forge's credentials, all-or-nothing at load time.
+
+    Partial config is almost certainly a typo rather than an intentional
+    half-setup, so fail fast instead of silently disabling the forge. An
+    empty string counts as unset."""
+    values = [source.get(name) or None for name in names]
+    if any(values) and not all(values):
+        joined = ", ".join(names)
+        raise ConfigError(
+            f"{joined} must be set together (or all left unset to disable "
+            "this forge)")
+    return values
+
+
+def _normalize_gitlab_url(raw_url):
+    """Validate and normalize GITLAB_URL.
+
+    Builds API/git URLs by concatenation, so a base with userinfo, a query,
+    or a fragment would smuggle credentials or break path joins; a missing
+    host or non-http(s) scheme is equally unusable. Only the trailing slash
+    is stripped — self-managed instances live under a path prefix."""
+    from urllib.parse import urlsplit
+
+    url = raw_url.rstrip("/")
+    try:
+        parsed = urlsplit(url)
+        valid = (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname is not None
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError(
+            "GITLAB_URL must be an http(s) base URL with a host and no "
+            "userinfo, query, or fragment")
+    return url
 
 
 def load_repo_config(
