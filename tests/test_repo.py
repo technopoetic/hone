@@ -152,3 +152,45 @@ def test_sweep_stale_worktrees_prunes_missing_dirs(manager, fixture_repo):
     out = fixture_repo["git"]("-C", str(mirror), "worktree", "list",
                               "--porcelain")
     assert str(ghost.path) not in out
+
+
+MR_REF = "refs/merge-requests/7/head"
+
+
+def test_extra_ref_makes_unbranched_commit_available(manager, fixture_repo):
+    fixture_repo["git"]("update-ref", MR_REF, fixture_repo["head_sha"])
+    fixture_repo["git"]("checkout", "-q", "main")
+    fixture_repo["git"]("branch", "-D", "feature")
+
+    mirror = manager.ensure_mirror(
+        "engineering/platform", "repo", source_refs=(MR_REF,))
+    assert fixture_repo["git"](
+        "-C", str(mirror), "rev-parse", MR_REF).strip() == fixture_repo["head_sha"]
+
+    worktree = manager.create_worktree(mirror, fixture_repo["head_sha"])
+    assert (worktree.path / "app.py").read_text() == "def run():\n    return 'new'\n"
+
+
+def test_extra_ref_is_refreshed_on_existing_mirror(manager, fixture_repo):
+    mirror = manager.ensure_mirror("ws", "repo")
+    fixture_repo["git"]("update-ref", MR_REF, fixture_repo["head_sha"])
+    manager.ensure_mirror("ws", "repo", source_refs=(MR_REF,))
+    assert fixture_repo["git"](
+        "-C", str(mirror), "rev-parse", MR_REF).strip() == fixture_repo["head_sha"]
+
+
+def test_sweep_discovers_nested_namespace_mirrors(manager, fixture_repo):
+    mirror = manager.ensure_mirror("engineering/platform", "repo")
+    worktree = manager.create_worktree(mirror, fixture_repo["head_sha"])
+    assert manager.sweep_stale_worktrees() == 1
+    assert not worktree.path.exists()
+
+
+@pytest.mark.parametrize("workspace,repo", [
+    ("../outside", "repo"),
+    ("/absolute/outside", "repo"),
+    ("ws", "../../outside"),
+])
+def test_mirror_paths_cannot_escape_data_dir(manager, workspace, repo):
+    with pytest.raises(GitError, match="escapes"):
+        manager.ensure_mirror(workspace, repo)

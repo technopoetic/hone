@@ -8,7 +8,7 @@ import base64
 import logging
 import subprocess
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,8 +52,17 @@ class RepoManager:
         self._remote_url_for = remote_url_for or (
             lambda ws, repo: f"https://bitbucket.org/{ws}/{repo}.git")
 
-    def ensure_mirror(self, workspace: str, repo: str) -> Path:
-        mirror = self.data_dir / "mirrors" / workspace / f"{repo}.git"
+    def ensure_mirror(
+        self, workspace: str, repo: str,
+        source_refs: Sequence[str] = (),
+    ) -> Path:
+        mirrors_root = self.data_dir / "mirrors"
+        mirror = mirrors_root / workspace / f"{repo}.git"
+        # GitLab namespaces nest (group/subgroup/repo), so `workspace` is
+        # untrusted path material: refuse any combination that leaves the
+        # mirrors root before touching the filesystem.
+        if not mirror.resolve().is_relative_to(mirrors_root.resolve()):
+            raise GitError("mirror path escapes the configured data directory")
         # A plain `git clone --bare` records no fetch refspec, so
         # `git fetch origin` only touches FETCH_HEAD and the mirror silently
         # never updates. Set it explicitly — records it for new clones and
@@ -69,6 +78,12 @@ class RepoManager:
                      self._remote_url_for(workspace, repo), str(mirror)],
                     cwd=mirror.parent, extra_header=self._auth_header)
             run_git(["config", "remote.origin.fetch", refspec], cwd=mirror)
+        # Forges whose PR head is not a branch tip (GitLab merge-request
+        # refs, including from forks — always fetchable from the target
+        # project, never a source URL) name the refs to pull explicitly.
+        for ref in source_refs:
+            run_git(["fetch", "origin", f"+{ref}:{ref}"], cwd=mirror,
+                    extra_header=self._auth_header)
         return mirror
 
     def create_worktree(self, mirror: Path, head_sha: str) -> WorktreeHandle:
@@ -101,7 +116,9 @@ class RepoManager:
         mirrors = self.data_dir / "mirrors"
         if not root.exists() or not mirrors.exists():
             return 0
-        for mirror in mirrors.glob("*/*.git"):
+        # rglob, not glob: GitLab namespaces nest, so mirrors can sit at
+        # any depth under the mirrors root.
+        for mirror in mirrors.rglob("*.git"):
             # Best-effort per mirror: a leaked job dir is cheap; blocking
             # every review because one mirror is corrupt (or holds a locked
             # worktree, which --force refuses) is not.
