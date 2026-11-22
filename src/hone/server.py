@@ -143,8 +143,14 @@ def _gitlab_command_from_comment(payload: dict, *, workspace: str,
     the shared gate says so)."""
     attributes = payload.get("object_attributes") or {}
     merge_request = payload.get("merge_request") or {}
+    # A truthy non-string note (int/list/dict) would crash the shared
+    # gate's `in`/`.strip()` calls. It's malformed shape, not a command —
+    # refuse it here so the gate only ever sees text.
+    note = attributes.get("note") or ""
+    if not isinstance(note, str):
+        return None
     return _route_command(
-        attributes.get("note") or "", attributes.get("author_id"),
+        note, attributes.get("author_id"),
         merge_request.get("author_id"), forge="gitlab",
         workspace=workspace, repo=repo, pr_id=pr_id)
 
@@ -177,7 +183,9 @@ def _valid_gitlab(secret: str, body: bytes, message_id: str | None,
         if not key:
             return False
         prefix = f"{message_id}.{timestamp}.".encode("ascii")
-    except (ValueError, UnicodeError, binascii.Error):
+    except (ValueError, UnicodeError, binascii.Error, OverflowError):
+        # A huge timestamp overflows time.time()-int(ts) float conversion;
+        # that is malformed auth input, never a 500.
         return False
 
     digest = hmac.new(key, prefix + body, hashlib.sha256).digest()
@@ -376,7 +384,7 @@ def create_app(
                     # review commentary (a present `position` key marks
                     # them even when null, the same key-presence rule the
                     # client's get_comments uses).
-                    if (not isinstance(pr_id, int)
+                    if (type(pr_id) is not int
                             or attributes.get("action") != "create"
                             or attributes.get(
                                 "noteable_type") != "MergeRequest"
@@ -406,7 +414,12 @@ def create_app(
                 log.warning("unparseable gitlab webhook payload "
                             "(event %r) ignored", event)
                 return PlainTextResponse("ignored", status_code=200)
-            if (not isinstance(pr_id, int)
+            # Exact type: bool is an int subclass and must not mean MR #1.
+            # The str check keeps an unhashable list/dict action out of the
+            # set-membership test (TypeError), which belongs to the fail-soft
+            # malformed-shape family, not a 500.
+            if (type(pr_id) is not int
+                    or not isinstance(action, str)
                     or action not in _GITLAB_REVIEW_ACTIONS):
                 return PlainTextResponse("ignored", status_code=200)
             enqueue(ReviewRequest(workspace=namespace, repo=slug,

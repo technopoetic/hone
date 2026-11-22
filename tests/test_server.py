@@ -643,6 +643,21 @@ def gitlab_receiver(monkeypatch):
     return TestClient(app), queued
 
 
+@pytest.fixture
+def gitlab_soft_receiver(monkeypatch):
+    """gitlab_receiver's app on a client that turns a handler crash into
+    a 500 response instead of re-raising into the test — for malformed-
+    input tests that assert a 403/200 contract and must never see an
+    exception, even while the underlying defect exists."""
+    monkeypatch.setattr("hone.server.time.time", lambda: GITLAB_NOW)
+    queued = []
+    app = create_app(
+        enqueue=queued.append,
+        gitlab_signing_token=GITLAB_SECRET,
+        gitlab_namespace=GITLAB_NAMESPACE)
+    return TestClient(app, raise_server_exceptions=False), queued
+
+
 def gitlab_mr_payload(action="open"):
     return {
         "project": {"path_with_namespace": "engineering/platform/hone"},
@@ -706,6 +721,26 @@ def test_gitlab_route_is_absent_when_not_configured():
 def test_gitlab_bad_or_stale_timestamp_is_forbidden(gitlab_receiver, timestamp):
     client, queued = gitlab_receiver
     body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(
+        client, body, timestamp=timestamp,
+        signature=sign_gitlab(body, timestamp=timestamp))
+    assert response.status_code == 403
+    assert queued == []
+
+
+def test_gitlab_huge_timestamp_is_forbidden(gitlab_soft_receiver,
+                                            monkeypatch):
+    # int() parses a 400-digit timestamp, but converting it to a float
+    # for the freshness comparison overflows — a malformed timestamp
+    # from an unauthenticated sender must still get a plain 403, never
+    # a 500. The clock is mocked to a FLOAT here: the shared fixture
+    # mocks an int, and int subtraction never overflows, so an int
+    # clock would hide the exact float-conversion crash production
+    # (real time.time) hits.
+    monkeypatch.setattr("hone.server.time.time", lambda: float(GITLAB_NOW))
+    client, queued = gitlab_soft_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    timestamp = "9" * 400
     response = post_gitlab(
         client, body, timestamp=timestamp,
         signature=sign_gitlab(body, timestamp=timestamp))
@@ -864,6 +899,35 @@ def test_gitlab_non_integer_iid_is_ignored(gitlab_receiver, iid):
     body = json.dumps(payload).encode()
     response = post_gitlab(client, body, signature=sign_gitlab(body))
     assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+@pytest.mark.parametrize("action", [[], {}])
+def test_gitlab_unhashable_action_is_ignored(gitlab_soft_receiver, action):
+    # a list/dict action is malformed payload shape; unguarded set
+    # membership on it raises TypeError, surfacing as a 500 instead of
+    # the fail-soft ignored 200 the shape contract promises
+    client, queued = gitlab_soft_receiver
+    body = json.dumps(gitlab_mr_payload(action)).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+@pytest.mark.parametrize("iid", [True, False])
+def test_gitlab_boolean_iid_is_not_an_integer_iid(
+        gitlab_soft_receiver, iid):
+    # bool is an int subclass — an exact-type check is what keeps
+    # "true" from meaning merge request 1
+    client, queued = gitlab_soft_receiver
+    payload = gitlab_mr_payload()
+    payload["object_attributes"]["iid"] = iid
+    body = json.dumps(payload).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert response.text == "ignored"
     assert queued == []
 
 
@@ -1023,6 +1087,31 @@ def test_gitlab_null_note_attributes_is_ignored(gitlab_receiver):
     payload["object_attributes"] = None
     response = post_gitlab_note(client, payload)
     assert response.status_code == 200
+    assert queued == []
+
+
+@pytest.mark.parametrize("note", [12345, ["@hone mute"],
+                                  {"body": "@hone mute"}])
+def test_gitlab_non_string_note_is_ignored(gitlab_soft_receiver, note):
+    # _route_command assumes a text note; a truthy non-string reaching it
+    # raises TypeError/AttributeError out of the extractor — malformed
+    # shape, so the contract here is a fail-soft ignored 200
+    client, queued = gitlab_soft_receiver
+    response = post_gitlab_note(client, gitlab_note_payload(note))
+    assert response.status_code == 200
+    assert queued == []
+
+
+@pytest.mark.parametrize("iid", [True, False])
+def test_gitlab_note_boolean_iid_is_ignored(gitlab_soft_receiver, iid):
+    # same exact-type rule as the MR path: a boolean IID must not enqueue
+    # a command against merge request 1 (True)
+    client, queued = gitlab_soft_receiver
+    payload = gitlab_note_payload("@hone mute")
+    payload["merge_request"]["iid"] = iid
+    response = post_gitlab_note(client, payload)
+    assert response.status_code == 200
+    assert response.text == "ignored"
     assert queued == []
 
 

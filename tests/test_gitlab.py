@@ -142,15 +142,18 @@ def test_get_diffstat_raises_on_malformed_next_page():
         make_client(handler).get_diffstat("hone", 7)
 
 
-def test_pagination_rejects_repeated_next_page():
+@pytest.mark.parametrize("bad_next_page", ["1", "0", "-2"])
+def test_pagination_rejects_non_increasing_next_page(bad_next_page):
     requested_pages = []
 
     def handler(request):
         requested_pages.append(request.url.params["page"])
         if len(requested_pages) > 1:
-            raise AssertionError("a repeated next page must not be requested")
+            raise AssertionError("a non-increasing next page must not be "
+                                 "requested")
         return httpx.Response(
-            200, headers={"X-Next-Page": "1"}, json=[{"body": "review"}])
+            200, headers={"X-Next-Page": bad_next_page},
+            json=[{"body": "review"}])
 
     with pytest.raises(ValueError, match="increasing"):
         make_client(handler).get_comments("hone", 7)
