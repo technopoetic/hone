@@ -1,7 +1,7 @@
 # GitLab forge — Design
 
 Date: 2026-11-21
-Status: approved in conversation, pending written-spec review
+Status: implemented
 Builds on: `docs/prds/2026-11-05-bitbucket-optional-design.md`
 
 ## Goal
