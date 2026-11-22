@@ -1,8 +1,10 @@
+import base64
 import hashlib
 import hmac
 import json
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -614,3 +616,436 @@ def test_github_plain_comment_triggers_nothing(github_receiver):
     assert r.status_code == 200
     assert r.text == "ignored"
     assert queued == []
+
+
+# --- GitLab webhook (/webhook/gitlab) -----------------------------------
+
+GITLAB_KEY = b"a test signing key with adequate entropy"
+GITLAB_SECRET = "whsec_" + base64.b64encode(GITLAB_KEY).decode()
+GITLAB_NAMESPACE = "engineering"
+GITLAB_NOW = 1_800_000_000
+
+
+def sign_gitlab(body: bytes, *, timestamp=str(GITLAB_NOW), message_id="msg-1"):
+    signed = f"{message_id}.{timestamp}.".encode() + body
+    digest = hmac.new(GITLAB_KEY, signed, hashlib.sha256).digest()
+    return "v1," + base64.b64encode(digest).decode()
+
+
+@pytest.fixture
+def gitlab_receiver(monkeypatch):
+    monkeypatch.setattr("hone.server.time.time", lambda: GITLAB_NOW)
+    queued = []
+    app = create_app(
+        enqueue=queued.append,
+        gitlab_signing_token=GITLAB_SECRET,
+        gitlab_namespace=GITLAB_NAMESPACE)
+    return TestClient(app), queued
+
+
+def gitlab_mr_payload(action="open"):
+    return {
+        "project": {"path_with_namespace": "engineering/platform/hone"},
+        "object_attributes": {"action": action, "iid": 9},
+    }
+
+
+def post_gitlab(client, body, *, event="Merge Request Hook",
+                signature=None, timestamp=str(GITLAB_NOW), message_id="msg-1"):
+    headers = {
+        "X-Gitlab-Event": event,
+        "webhook-id": message_id,
+        "webhook-timestamp": timestamp,
+    }
+    if signature is not None:
+        headers["webhook-signature"] = signature
+    return client.post("/webhook/gitlab", content=body, headers=headers)
+
+
+@pytest.mark.parametrize("action", ["open", "reopen", "update"])
+def test_gitlab_review_actions_enqueue(gitlab_receiver, action):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload(action)).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert queued == [ReviewRequest(
+        workspace="engineering/platform", repo="hone", pr_id=9,
+        forge="gitlab")]
+
+
+@pytest.mark.parametrize("action", ["close", "merge", "approved"])
+def test_gitlab_non_review_actions_are_ignored(gitlab_receiver, action):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload(action)).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+def test_gitlab_unknown_event_is_ignored(gitlab_receiver):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(
+        client, body, event="Push Hook", signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+def test_gitlab_route_is_absent_when_not_configured():
+    client = TestClient(create_app(enqueue=lambda request: None))
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("timestamp", [
+    "", "not-a-number", str(GITLAB_NOW - 301), str(GITLAB_NOW + 301),
+])
+def test_gitlab_bad_or_stale_timestamp_is_forbidden(gitlab_receiver, timestamp):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(
+        client, body, timestamp=timestamp,
+        signature=sign_gitlab(body, timestamp=timestamp))
+    assert response.status_code == 403
+    assert queued == []
+
+
+def test_gitlab_accepts_one_of_multiple_signatures(gitlab_receiver):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(
+        client, body,
+        signature=f"v2,ignored v1,not-the-signature {sign_gitlab(body)}")
+    assert response.status_code == 200
+    assert len(queued) == 1
+
+
+@pytest.mark.parametrize("missing_header", ["webhook-id", "webhook-signature"])
+def test_gitlab_missing_standard_webhook_auth_is_forbidden(
+        gitlab_receiver, missing_header):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    headers = {
+        "X-Gitlab-Event": "Merge Request Hook",
+        "webhook-id": "msg-1",
+        "webhook-timestamp": str(GITLAB_NOW),
+        "webhook-signature": sign_gitlab(body),
+    }
+    del headers[missing_header]
+    response = client.post("/webhook/gitlab", content=body, headers=headers)
+    assert response.status_code == 403
+    assert queued == []
+
+
+def test_gitlab_wrong_signature_is_forbidden(gitlab_receiver):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(
+        client, body, signature=sign_gitlab(body, message_id="another-message"))
+    assert response.status_code == 403
+    assert queued == []
+
+
+def test_gitlab_tampered_raw_body_is_forbidden(gitlab_receiver):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    tampered = body.replace(b'"open"', b'"update"')
+    assert tampered != body
+    response = post_gitlab(client, tampered, signature=sign_gitlab(body))
+    assert response.status_code == 403
+    assert queued == []
+
+
+def test_gitlab_v2_only_signature_is_forbidden(gitlab_receiver):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    signature = "v2," + sign_gitlab(body).partition(",")[2]
+    response = post_gitlab(client, body, signature=signature)
+    assert response.status_code == 403
+    assert queued == []
+
+
+def test_gitlab_legacy_token_is_not_authentication(gitlab_receiver):
+    client, queued = gitlab_receiver
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = client.post(
+        "/webhook/gitlab", content=body,
+        headers={
+            "X-Gitlab-Event": "Merge Request Hook",
+            "X-Gitlab-Token": GITLAB_SECRET,
+            "webhook-id": "msg-1",
+            "webhook-timestamp": str(GITLAB_NOW),
+        })
+    assert response.status_code == 403
+    assert queued == []
+
+
+@pytest.mark.parametrize("secret", ["not-whsec", "whsec_!!!", "whsec_"])
+def test_gitlab_malformed_signing_token_is_forbidden(monkeypatch, secret):
+    monkeypatch.setattr("hone.server.time.time", lambda: GITLAB_NOW)
+    queued = []
+    app = create_app(
+        enqueue=queued.append, gitlab_signing_token=secret,
+        gitlab_namespace=GITLAB_NAMESPACE)
+    client = TestClient(app, raise_server_exceptions=False)
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 403
+    assert queued == []
+
+
+def test_gitlab_non_ascii_signature_header_is_forbidden(monkeypatch):
+    monkeypatch.setattr("hone.server.time.time", lambda: GITLAB_NOW)
+    queued = []
+    app = create_app(
+        enqueue=queued.append, gitlab_signing_token=GITLAB_SECRET,
+        gitlab_namespace=GITLAB_NAMESPACE)
+    # raise_server_exceptions=False is captured at client construction in
+    # starlette, so mutating an existing client is a no-op — build one here.
+    client = TestClient(app, raise_server_exceptions=False)
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = client.post(
+        "/webhook/gitlab", content=body,
+        headers={
+            "X-Gitlab-Event": "Merge Request Hook",
+            "webhook-id": b"msg-1",
+            "webhook-timestamp": str(GITLAB_NOW).encode(),
+            "webhook-signature": b"v1," + "é".encode("latin-1") * 44,
+        })
+    assert response.status_code == 403
+    assert queued == []
+
+
+@pytest.mark.parametrize("full_path", ["engineering-other/hone", "someone/hone"])
+def test_gitlab_foreign_namespace_is_ignored(gitlab_receiver, full_path):
+    client, queued = gitlab_receiver
+    payload = gitlab_mr_payload()
+    payload["project"]["path_with_namespace"] = full_path
+    body = json.dumps(payload).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+@pytest.mark.parametrize("project", [
+    {"path_with_namespace": "engineering"},
+    {},
+    {"path_with_namespace": ""},
+    {"other_key": "engineering/platform/hone"},
+])
+def test_gitlab_malformed_project_is_ignored(gitlab_receiver, project):
+    client, queued = gitlab_receiver
+    payload = gitlab_mr_payload()
+    payload["project"] = project
+    body = json.dumps(payload).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert queued == []
+
+
+def test_gitlab_signed_malformed_json_is_ignored(gitlab_receiver):
+    client, queued = gitlab_receiver
+    body = b"{not-json"
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+@pytest.mark.parametrize("iid", ["9", None])
+def test_gitlab_non_integer_iid_is_ignored(gitlab_receiver, iid):
+    client, queued = gitlab_receiver
+    payload = gitlab_mr_payload()
+    payload["object_attributes"]["iid"] = iid
+    body = json.dumps(payload).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert queued == []
+
+
+def test_gitlab_enqueue_failure_propagates_as_500(monkeypatch, caplog):
+    monkeypatch.setattr("hone.server.time.time", lambda: GITLAB_NOW)
+    calls = []
+
+    def full_queue(request):
+        calls.append(request)
+        raise ValueError("queue write failed")
+
+    app = create_app(
+        enqueue=full_queue, gitlab_signing_token=GITLAB_SECRET,
+        gitlab_namespace=GITLAB_NAMESPACE)
+    client = TestClient(app, raise_server_exceptions=False)
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 500
+    assert len(calls) == 1
+    assert not any("unparseable gitlab webhook" in record.getMessage()
+                   for record in caplog.records)
+
+
+def gitlab_note_payload(
+        text="@hone mute", *, action="create", actor=1001, author=1001,
+        noteable_type="MergeRequest", system=False, internal=False,
+        note_type=None, position=None):
+    attributes = {
+        "action": action, "note": text, "noteable_type": noteable_type,
+        "author_id": actor, "system": system, "internal": internal,
+    }
+    if note_type is not None:
+        attributes["type"] = note_type
+    if position is not None:
+        attributes["position"] = position
+    return {
+        "project": {"path_with_namespace": "engineering/platform/hone"},
+        "object_attributes": attributes,
+        "merge_request": {"iid": 9, "author_id": author},
+    }
+
+
+def post_gitlab_note(client, payload):
+    body = json.dumps(payload).encode()
+    return post_gitlab(
+        client, body, event="Note Hook", signature=sign_gitlab(body))
+
+
+@pytest.mark.parametrize("action", ["mute", "unmute"])
+def test_gitlab_mute_commands_from_author_enqueue(gitlab_receiver, action):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(
+        client, gitlab_note_payload(f"@hone {action}"))
+    assert response.status_code == 200
+    assert queued == [CommandRequest(
+        workspace="engineering/platform", repo="hone", pr_id=9,
+        action=action, forge="gitlab")]
+
+
+def test_gitlab_review_command_enqueues_forced_review(gitlab_receiver):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(client, gitlab_note_payload("@hone review"))
+    assert response.status_code == 200
+    assert queued == [ReviewRequest(
+        workspace="engineering/platform", repo="hone", pr_id=9,
+        force=True, forge="gitlab")]
+
+
+def test_gitlab_command_is_matched_after_strip_and_case_only(gitlab_receiver):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(
+        client, gitlab_note_payload("  @Hone MUTE \n"))
+    assert response.status_code == 200
+    assert queued == [CommandRequest(
+        workspace="engineering/platform", repo="hone", pr_id=9,
+        action="mute", forge="gitlab")]
+
+
+def test_gitlab_command_inside_prose_is_rejected(gitlab_receiver):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(
+        client, gitlab_note_payload("should we ask @hone mute?"))
+    assert response.status_code == 200
+    assert queued == []
+
+
+def test_gitlab_command_from_non_author_is_ignored(gitlab_receiver):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(client, gitlab_note_payload(actor=2002))
+    assert response.status_code == 200
+    assert queued == []
+
+
+@pytest.mark.parametrize("missing_identity", ["actor", "author"])
+def test_gitlab_command_with_missing_identity_is_ignored(
+        gitlab_receiver, missing_identity):
+    client, queued = gitlab_receiver
+    payload = gitlab_note_payload()
+    if missing_identity == "actor":
+        del payload["object_attributes"]["author_id"]
+    else:
+        del payload["merge_request"]["author_id"]
+    response = post_gitlab_note(client, payload)
+    assert response.status_code == 200
+    assert queued == []
+
+
+def test_gitlab_hone_marker_comment_never_triggers_command(gitlab_receiver):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(
+        client, gitlab_note_payload("<!-- hone:review:abc -->\n@hone mute"))
+    assert response.status_code == 200
+    assert queued == []
+
+
+@pytest.mark.parametrize("overrides", [
+    {"action": "update"},
+    {"noteable_type": "Issue"},
+    {"system": True},
+    {"internal": True},
+    {"note_type": "DiffNote"},
+    {"position": {"new_line": 4}},
+])
+def test_gitlab_ineligible_notes_are_ignored(gitlab_receiver, overrides):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(
+        client, gitlab_note_payload(**overrides))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+def test_gitlab_plain_comment_triggers_nothing(gitlab_receiver):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(
+        client, gitlab_note_payload("looks good to me"))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+def test_gitlab_malformed_note_payload_is_ignored(gitlab_receiver):
+    client, queued = gitlab_receiver
+    payload = gitlab_note_payload()
+    del payload["merge_request"]["iid"]
+    response = post_gitlab_note(client, payload)
+    assert response.status_code == 200
+    assert queued == []
+
+
+def test_gitlab_null_note_attributes_is_ignored(gitlab_receiver):
+    # object_attributes must be a mapping: null notes from a signature
+    # holder are malformed authenticated payloads and must fail soft,
+    # never surface as a 500 out of the eligibility filters.
+    client, queued = gitlab_receiver
+    payload = gitlab_note_payload()
+    payload["object_attributes"] = None
+    response = post_gitlab_note(client, payload)
+    assert response.status_code == 200
+    assert queued == []
+
+
+def test_serve_mounts_configured_gitlab_route(monkeypatch):
+    monkeypatch.setattr("hone.server.time.time", lambda: GITLAB_NOW)
+    captured = {}
+    monkeypatch.setattr(
+        "uvicorn.run", lambda app, **kwargs: captured.update(app=app))
+    settings = make_serve_settings("gitlab", with_secret=True)
+    settings.gitlab_webhook_signing_token = GITLAB_SECRET
+    serve(settings, process_factory=lambda: lambda request: None)
+    client = TestClient(captured["app"])
+    body = json.dumps(gitlab_mr_payload()).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+
+
+def test_serve_refuses_gitlab_secret_without_namespace(monkeypatch):
+    def fail_run(*args, **kwargs):
+        raise AssertionError("server must not bind")
+
+    monkeypatch.setattr("uvicorn.run", fail_run)
+    settings = make_serve_settings("gitlab", with_secret=True)
+    settings.gitlab_namespace = None
+    with pytest.raises(SystemExit, match="GITLAB_NAMESPACE"):
+        serve(settings, process_factory=lambda: lambda request: None)

@@ -142,6 +142,21 @@ def test_get_diffstat_raises_on_malformed_next_page():
         make_client(handler).get_diffstat("hone", 7)
 
 
+def test_pagination_rejects_repeated_next_page():
+    requested_pages = []
+
+    def handler(request):
+        requested_pages.append(request.url.params["page"])
+        if len(requested_pages) > 1:
+            raise AssertionError("a repeated next page must not be requested")
+        return httpx.Response(
+            200, headers={"X-Next-Page": "1"}, json=[{"body": "review"}])
+
+    with pytest.raises(ValueError, match="increasing"):
+        make_client(handler).get_comments("hone", 7)
+    assert requested_pages == ["1"]
+
+
 def test_get_pull_request_raises_on_http_failure():
     def handler(request):
         return httpx.Response(500)

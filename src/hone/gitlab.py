@@ -29,7 +29,11 @@ class GitLabClient:
                   params: dict | None = None) -> list[dict]:
         """Follow X-Next-Page until GitLab stops sending it. A non-numeric
         header is malformed server state, so surface it instead of either
-        looping or dropping the remaining pages."""
+        looping or dropping the remaining pages — and so is a header that
+        doesn't advance the page: a value <= the current page (a server
+        echoing the same next page forever) would otherwise loop to
+        infinity, since the page-number trust here is the only thing
+        keeping the loop finite."""
         items: list[dict] = []
         page = 1
         while True:
@@ -38,10 +42,14 @@ class GitLabClient:
                 params={**(params or {}), "per_page": PER_PAGE, "page": page})
             r.raise_for_status()
             items.extend(r.json())
-            next_page = r.headers.get("x-next-page")
-            if not next_page:
+            header = r.headers.get("x-next-page")
+            if not header:
                 return items
-            page = int(next_page)
+            next_page = int(header)
+            if next_page <= page:
+                raise ValueError(
+                    f"x-next-page must be strictly increasing, got {header}")
+            page = next_page
 
     @staticmethod
     def _line_counts(diff: str | None) -> tuple[int, int]:
