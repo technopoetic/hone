@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from hone.cli import _github_repos, build_process, main, parse_pr_url
 from hone.config import Settings
+from hone.gitlab import GitLabClient
 from hone.server import CommandRequest, ReviewRequest
 
 
@@ -58,11 +60,11 @@ def test_serve_github_only_without_secret_is_a_config_error(
     assert not (tmp_path / "data" / "logs").exists()
 
 
-def test_serve_wires_gitlab_client_and_mirror_manager(
+def test_serve_scopes_gitlab_api_calls_to_request_namespace(
         tmp_path, monkeypatch):
-    # GitLab-only serve boot: the process's forges/repo_managers dicts
-    # must carry the gitlab client (pinned to the CONFIGURED namespace)
-    # and its isolated mirror manager, and rq.forge must dispatch to them
+    # A configured parent group may enqueue a descendant subgroup. Drive the
+    # real client's metadata, note, and diff methods through the served
+    # process so its encoded project path is checked across both job types.
     settings = _settings(
         tmp_path, bitbucket_email=None, bitbucket_username=None,
         bitbucket_api_key=None, bitbucket_workspace=None,
@@ -75,12 +77,34 @@ def test_serve_wires_gitlab_client_and_mirror_manager(
     monkeypatch.setattr("hone.cli.configure_logging",
                         lambda data_dir: data_dir / "logs" / "hone.log")
 
+    requests = []
+
+    def handle_api(request):
+        requests.append(request)
+        path = request.url.path
+        if path.endswith("/merge_requests/5"):
+            return httpx.Response(200, json={
+                "title": "Add thing", "description": "does a thing",
+                "author": {"username": "octo"}, "source_branch": "feature",
+                "sha": "a" * 40, "target_branch": "main",
+                "diff_refs": {"start_sha": "b" * 40},
+            })
+        if request.method == "GET" and path.endswith("/notes"):
+            return httpx.Response(200, json=[])
+        if path.endswith("/diffs"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and path.endswith("/notes"):
+            return httpx.Response(201, json={"id": 1})
+        raise AssertionError(f"unexpected GitLab request: {request.url}")
+
     gitlab_clients = []
 
-    class FakeGitLabClient:
+    class FakeGitLabClient(GitLabClient):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             gitlab_clients.append(self)
+            super().__init__(**kwargs, http=httpx.Client(
+                transport=httpx.MockTransport(handle_api)))
 
     class FakeManager:
         def sweep_stale_worktrees(self):
@@ -100,8 +124,11 @@ def test_serve_wires_gitlab_client_and_mirror_manager(
 
     review_calls = []
 
-    def fake_run_review(job, **kwargs):
-        review_calls.append(kwargs)
+    def fake_run_review(job, *, forge, repos, **kwargs):
+        review_calls.append({"forge": forge, "repos": repos, **kwargs})
+        forge.get_pull_request(job.repo, job.pr_id)
+        forge.get_comments(job.repo, job.pr_id)
+        forge.get_diffstat(job.repo, job.pr_id)
         return SimpleNamespace(skipped=False, final_text="t", posted=True)
 
     monkeypatch.setattr("hone.cli.GitLabClient", FakeGitLabClient)
@@ -112,26 +139,42 @@ def test_serve_wires_gitlab_client_and_mirror_manager(
     def bitbucket_boom(*args, **kwargs):
         raise AssertionError(
             "BitbucketClient must not be constructed for a GitLab-only serve")
+
     def github_boom(*args, **kwargs):
         raise AssertionError(
             "GitHubClient must not be constructed for a GitLab-only serve")
+
     monkeypatch.setattr("hone.cli.BitbucketClient", bitbucket_boom)
     monkeypatch.setattr("hone.cli.GitHubClient", github_boom)
 
     rc = main(["serve"])
 
     assert rc == 0
-    (client,) = gitlab_clients
+    served["process"](ReviewRequest(
+        workspace="engineering/platform", repo="hone", pr_id=5,
+        forge="gitlab"))
+    served["process"](CommandRequest(
+        workspace="engineering/platform", repo="hone", pr_id=5,
+        action="mute", forge="gitlab"))
+
+    project = b"/gitlab/api/v4/projects/engineering%2Fplatform%2Fhone"
+    assert [(request.method, request.url.raw_path.partition(b"?")[0])
+            for request in requests] == [
+        ("GET", project + b"/merge_requests/5"),
+        ("GET", project + b"/merge_requests/5/notes"),
+        ("GET", project + b"/merge_requests/5/diffs"),
+        ("POST", project + b"/merge_requests/5/notes"),
+    ]
+    assert [client.kwargs for client in gitlab_clients] == [
+        {"token": "glpat", "base_url": "https://git.example.com/gitlab",
+         "namespace": "engineering/platform"},
+        {"token": "glpat", "base_url": "https://git.example.com/gitlab",
+         "namespace": "engineering/platform"},
+    ]
     (mgr,) = managers
-    assert client.kwargs == {"token": "glpat",
-                             "base_url": "https://git.example.com/gitlab",
-                             "namespace": "engineering"}
-    # a gitlab job dispatched through the served process lands on exactly
-    # that client and that manager
-    served["process"](ReviewRequest(workspace="engineering", repo="repo",
-                                     pr_id=5, forge="gitlab"))
-    (kwargs,) = review_calls
-    assert kwargs["forge"] is client and kwargs["repos"] is mgr
+    (review_kwargs,) = review_calls
+    assert review_kwargs["forge"] is gitlab_clients[0]
+    assert review_kwargs["repos"] is mgr
 
 
 def test_parse_valid_bitbucket_url():

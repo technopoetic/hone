@@ -54,11 +54,13 @@ class GitLabClient:
     @staticmethod
     def _line_counts(diff: str | None) -> tuple[int, int]:
         added = removed = 0
+        in_hunk = False
         for line in (diff or "").splitlines():
-            # A per-file diff normally starts at @@ and carries no file
-            # headers, but a content line may legitimately begin with
-            # '+++'/'---'. Only skip the header forms with a trailing space.
-            if line.startswith(("+++ ", "--- ")):
+            if line.startswith("@@"):
+                in_hunk = True
+            # Only file headers before the first hunk are metadata. Once a
+            # hunk starts, header-shaped lines are content, like '+++literal'.
+            if not in_hunk and line.startswith(("+++ ", "--- ")):
                 continue
             added += line.startswith("+")
             removed += line.startswith("-")

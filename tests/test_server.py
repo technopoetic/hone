@@ -866,6 +866,31 @@ def test_gitlab_foreign_namespace_is_ignored(gitlab_receiver, full_path):
     assert queued == []
 
 
+@pytest.mark.parametrize("full_path", [
+    "engineering/../foreign/hone",
+    "engineering/platform/../../foreign/hone",
+    "engineering/./hone",
+    "engineering/platform/./hone",
+    "engineering//hone",
+    "engineering/platform//hone",
+    "engineering/.",
+    "engineering/platform/..",
+])
+def test_gitlab_dot_or_empty_path_segments_are_ignored(
+        gitlab_receiver, full_path):
+    # Path components are semantic identifiers, not strings to normalize
+    # after the namespace pin. Parent, current-directory, and empty segments
+    # must fail soft before they can satisfy a textual descendant prefix.
+    client, queued = gitlab_receiver
+    payload = gitlab_mr_payload()
+    payload["project"]["path_with_namespace"] = full_path
+    body = json.dumps(payload).encode()
+    response = post_gitlab(client, body, signature=sign_gitlab(body))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
 @pytest.mark.parametrize("project", [
     {"path_with_namespace": "engineering"},
     {},
@@ -1032,6 +1057,28 @@ def test_gitlab_command_with_missing_identity_is_ignored(
         del payload["merge_request"]["author_id"]
     response = post_gitlab_note(client, payload)
     assert response.status_code == 200
+    assert queued == []
+
+
+@pytest.mark.parametrize("actor,author", [(True, 1), (1, True), (True, True)])
+def test_gitlab_boolean_command_identities_are_ignored(
+        gitlab_receiver, actor, author):
+    # bool is an int subclass and True == 1, so the shared equality gate
+    # alone cannot establish GitLab's numeric-ID payload contract.
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(
+        client, gitlab_note_payload(actor=actor, author=author))
+    assert response.status_code == 200
+    assert response.text == "ignored"
+    assert queued == []
+
+
+def test_gitlab_string_command_identities_are_ignored(gitlab_receiver):
+    client, queued = gitlab_receiver
+    response = post_gitlab_note(
+        client, gitlab_note_payload(actor="1001", author="1001"))
+    assert response.status_code == 200
+    assert response.text == "ignored"
     assert queued == []
 
 

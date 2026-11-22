@@ -81,6 +81,29 @@ def test_get_diffstat_maps_patch_counts_statuses_and_pages():
     ]
 
 
+def test_get_diffstat_counts_header_shaped_lines_after_hunk_start():
+    diff = (
+        "--- a/example.txt\n"
+        "+++ b/example.txt\n"
+        "@@ -1 +1 @@\n"
+        "--- \n"
+        "+++ \n"
+        "---literal\n"
+        "+++literal\n"
+    )
+
+    def handler(request):
+        return httpx.Response(200, json=[{
+            "new_path": "example.txt", "old_path": "example.txt",
+            "new_file": False, "deleted_file": False,
+            "renamed_file": False, "diff": diff,
+        }])
+
+    assert make_client(handler).get_diffstat("hone", 7) == [
+        ("example.txt", "modified", 2, 2),
+    ]
+
+
 def test_get_diffstat_maps_added_modified_and_opaque_entries():
     def handler(request):
         assert request.url.params["page"] == "1"

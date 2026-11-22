@@ -107,11 +107,13 @@ def _github_repos(settings: Settings, data_dir) -> RepoManager:
 
 
 def build_process(settings: Settings, *, forges: dict[str, Forge],
-                  repo_managers: dict[str, RepoManager]
+                  repo_managers: dict[str, RepoManager],
+                  gitlab_factory: Callable[[str], Forge] | None = None
                   ) -> Callable[[ReviewRequest | CommandRequest], None]:
     """Turn a ReviewRequest/CommandRequest into one worker action.
     `forges`/`repo_managers` are keyed by `req.forge` — whichever forges
-    are configured for this process.
+    are configured for this process. Serve supplies `gitlab_factory` because
+    one configured GitLab parent namespace admits descendant request paths.
 
     Review requests become one live (never dry-run) run_review call — the
     server has no dry-run mode, posting is its only behavior. Command
@@ -120,7 +122,9 @@ def build_process(settings: Settings, *, forges: dict[str, Forge],
     catches and logs them so one bad job never kills the server.
     """
     def process(req: ReviewRequest | CommandRequest) -> None:
-        forge = forges[req.forge]
+        forge = (gitlab_factory(req.workspace)
+                 if req.forge == "gitlab" and gitlab_factory is not None
+                 else forges[req.forge])
         if isinstance(req, CommandRequest):
             _log.info("command %s for %s/%s#%d", req.action, req.workspace,
                       req.repo, req.pr_id)
@@ -158,10 +162,11 @@ def _serve() -> int:
     log_path = configure_logging(settings.data_dir)
     _log.info("logging to %s", log_path)
 
-    # Only enabled forges get clients: a disabled forge's route is never
-    # mounted (see serve), so a client for it could never receive a job.
+    # Only enabled forges get clients or request-scoped factories: a disabled
+    # forge's route is never mounted, so neither could ever receive a job.
     forges: dict[str, Forge] = {}
     repo_managers: dict[str, RepoManager] = {}
+    gitlab_factory: Callable[[str], Forge] | None = None
     if settings.bitbucket_api_key:
         # No URL to parse a workspace from on this path: the server is
         # pinned to the configured workspace (the route rejects any
@@ -179,15 +184,15 @@ def _serve() -> int:
                                          owner=settings.github_owner)
         repo_managers["github"] = _github_repos(settings, settings.data_dir)
     if settings.gitlab_token:
-        # Pinned to the CONFIGURED namespace like the Bitbucket client
-        # above: the server has no URL to parse one from, and the GitLab
-        # route that lands in Task 6 is pinned to the same namespace. The
-        # mirror manager gets the isolated gitlab subtree (see
-        # _gitlab_repos) and therefore its own sweep in the loop below.
-        forges["gitlab"] = GitLabClient(
-            token=settings.gitlab_token,
-            base_url=settings.gitlab_url,
-            namespace=settings.gitlab_namespace)
+        # The route admits descendants of the configured namespace, so each
+        # job needs a client for the namespace carried by its own request.
+        # The mirror manager resolves that same request workspace per job.
+        def gitlab_factory(namespace: str) -> Forge:
+            return GitLabClient(
+                token=settings.gitlab_token,
+                base_url=settings.gitlab_url,
+                namespace=namespace)
+
         repo_managers["gitlab"] = _gitlab_repos(settings, settings.data_dir)
 
     # One sweep per boot: the only safe moment is process start, before the
@@ -205,7 +210,8 @@ def _serve() -> int:
         _log.info("swept %d stale worktree(s) from previous runs", removed)
 
     process = build_process(settings, forges=forges,
-                            repo_managers=repo_managers)
+                            repo_managers=repo_managers,
+                            gitlab_factory=gitlab_factory)
     serve(settings, process_factory=lambda: process)
     return 0
 

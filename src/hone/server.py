@@ -149,9 +149,12 @@ def _gitlab_command_from_comment(payload: dict, *, workspace: str,
     note = attributes.get("note") or ""
     if not isinstance(note, str):
         return None
+    actor = attributes.get("author_id")
+    author = merge_request.get("author_id")
+    if type(actor) is not int or type(author) is not int:
+        return None
     return _route_command(
-        note, attributes.get("author_id"),
-        merge_request.get("author_id"), forge="gitlab",
+        note, actor, author, forge="gitlab",
         workspace=workspace, repo=repo, pr_id=pr_id)
 
 
@@ -352,7 +355,9 @@ def create_app(
                 # "group/sub/project" into namespace "group/sub" and slug.
                 full_path = payload["project"]["path_with_namespace"]
                 namespace, separator, slug = full_path.rpartition("/")
-                if not separator or not namespace or not slug:
+                if (not separator or any(
+                        segment in {"", ".", ".."}
+                        for segment in full_path.split("/"))):
                     raise ValueError("invalid GitLab project path")
             except (KeyError, TypeError, ValueError, AttributeError):
                 # Same fail-open contract as the other forges: a
