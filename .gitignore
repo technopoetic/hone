@@ -4,6 +4,7 @@ __pycache__/
 .env
 DEPLOY.local.md
 .pytest_cache/
+.worktrees/
 node_modules/
 tags
 tags.lock
