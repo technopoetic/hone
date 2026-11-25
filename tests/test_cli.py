@@ -1,7 +1,11 @@
+from types import SimpleNamespace
+
+import httpx
 import pytest
 
 from hone.cli import _github_repos, build_process, main, parse_pr_url
 from hone.config import Settings
+from hone.gitlab import GitLabClient
 from hone.server import CommandRequest, ReviewRequest
 
 
@@ -12,26 +16,165 @@ def _settings(tmp_path, **overrides):
         bitbucket_workspace="ws", data_dir=tmp_path / "data",
         tool_commands={"ruff": ("ruff", "check", ".")},
         repo_checks={"repo": ("ruff",)},
-        max_turns=7, webhook_secret=None, port=8420)
+        max_turns=7, bitbucket_webhook_secret=None, port=8420)
     return Settings(**{**base, **overrides})
 
 
-def test_serve_without_webhook_secret_is_a_config_error(tmp_path, monkeypatch,
-                                                        capsys):
+def test_serve_without_bitbucket_webhook_secret_is_a_config_error(
+        tmp_path, monkeypatch, capsys):
     # serve's only mode is posting, so a missing secret is a startup config
     # error like any other: house error shape, exit 2, BEFORE logging/clients/
     # sweep leave side effects on a boot that can never proceed
-    monkeypatch.setattr("hone.cli.load_settings",
-                        lambda: _settings(tmp_path, webhook_secret=None))
+    monkeypatch.setattr(
+        "hone.cli.load_settings",
+        lambda: _settings(tmp_path, bitbucket_webhook_secret=None))
     monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
 
     rc = main(["serve"])
 
     assert rc == 2
-    assert "error: HONE_WEBHOOK_SECRET is required for serve" in (
+    assert "error: BITBUCKET_WEBHOOK_SECRET is required for serve" in (
         capsys.readouterr().err)
     # failed before any startup side effect: no log dir created
     assert not (tmp_path / "data" / "logs").exists()
+
+
+def test_serve_github_only_without_secret_is_a_config_error(
+        tmp_path, monkeypatch, capsys):
+    # same refusal, symmetric: GitHub as the only enabled forge keeps its
+    # own specific error, not a Bitbucket-flavored one
+    monkeypatch.setattr(
+        "hone.cli.load_settings",
+        lambda: _settings(
+            tmp_path, bitbucket_email=None, bitbucket_username=None,
+            bitbucket_api_key=None, bitbucket_workspace=None,
+            github_token="tok", github_owner="octo-org",
+            github_webhook_secret=None))
+    monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
+
+    rc = main(["serve"])
+
+    assert rc == 2
+    assert "error: GITHUB_WEBHOOK_SECRET is required for serve" in (
+        capsys.readouterr().err)
+    assert not (tmp_path / "data" / "logs").exists()
+
+
+def test_serve_scopes_gitlab_api_calls_to_request_namespace(
+        tmp_path, monkeypatch):
+    # A configured parent group may enqueue a descendant subgroup. Drive the
+    # real client's metadata, note, and diff methods through the served
+    # process so its encoded project path is checked across both job types.
+    settings = _settings(
+        tmp_path, bitbucket_email=None, bitbucket_username=None,
+        bitbucket_api_key=None, bitbucket_workspace=None,
+        github_token=None, github_owner=None,
+        gitlab_token="glpat", gitlab_url="https://git.example.com/gitlab",
+        gitlab_namespace="engineering",
+        gitlab_webhook_signing_token="sign")
+    monkeypatch.setattr("hone.cli.load_settings", lambda: settings)
+    monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
+    monkeypatch.setattr("hone.cli.configure_logging",
+                        lambda data_dir: data_dir / "logs" / "hone.log")
+
+    requests = []
+
+    def handle_api(request):
+        requests.append(request)
+        path = request.url.path
+        if path.endswith("/merge_requests/5"):
+            return httpx.Response(200, json={
+                "title": "Add thing", "description": "does a thing",
+                "author": {"username": "octo"}, "source_branch": "feature",
+                "sha": "a" * 40, "target_branch": "main",
+                "diff_refs": {"start_sha": "b" * 40},
+            })
+        if request.method == "GET" and path.endswith("/notes"):
+            return httpx.Response(200, json=[])
+        if path.endswith("/diffs"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and path.endswith("/notes"):
+            return httpx.Response(201, json={"id": 1})
+        raise AssertionError(f"unexpected GitLab request: {request.url}")
+
+    gitlab_clients = []
+
+    class FakeGitLabClient(GitLabClient):
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            gitlab_clients.append(self)
+            super().__init__(**kwargs, http=httpx.Client(
+                transport=httpx.MockTransport(handle_api)))
+
+    class FakeManager:
+        def sweep_stale_worktrees(self):
+            return 0
+
+    managers = []
+
+    def fake_gitlab_repos(settings, data_dir):
+        mgr = FakeManager()
+        managers.append(mgr)
+        return mgr
+
+    served = {}
+
+    def fake_serve(settings, process_factory):
+        served["process"] = process_factory()
+
+    review_calls = []
+
+    def fake_run_review(job, *, forge, repos, **kwargs):
+        review_calls.append({"forge": forge, "repos": repos, **kwargs})
+        forge.get_pull_request(job.repo, job.pr_id)
+        forge.get_comments(job.repo, job.pr_id)
+        forge.get_diffstat(job.repo, job.pr_id)
+        return SimpleNamespace(skipped=False, final_text="t", posted=True)
+
+    monkeypatch.setattr("hone.cli.GitLabClient", FakeGitLabClient)
+    monkeypatch.setattr("hone.cli._gitlab_repos", fake_gitlab_repos)
+    monkeypatch.setattr("hone.cli.serve", fake_serve)
+    monkeypatch.setattr("hone.cli.run_review", fake_run_review)
+
+    def bitbucket_boom(*args, **kwargs):
+        raise AssertionError(
+            "BitbucketClient must not be constructed for a GitLab-only serve")
+
+    def github_boom(*args, **kwargs):
+        raise AssertionError(
+            "GitHubClient must not be constructed for a GitLab-only serve")
+
+    monkeypatch.setattr("hone.cli.BitbucketClient", bitbucket_boom)
+    monkeypatch.setattr("hone.cli.GitHubClient", github_boom)
+
+    rc = main(["serve"])
+
+    assert rc == 0
+    served["process"](ReviewRequest(
+        workspace="engineering/platform", repo="hone", pr_id=5,
+        forge="gitlab"))
+    served["process"](CommandRequest(
+        workspace="engineering/platform", repo="hone", pr_id=5,
+        action="mute", forge="gitlab"))
+
+    project = b"/gitlab/api/v4/projects/engineering%2Fplatform%2Fhone"
+    assert [(request.method, request.url.raw_path.partition(b"?")[0])
+            for request in requests] == [
+        ("GET", project + b"/merge_requests/5"),
+        ("GET", project + b"/merge_requests/5/notes"),
+        ("GET", project + b"/merge_requests/5/diffs"),
+        ("POST", project + b"/merge_requests/5/notes"),
+    ]
+    assert [client.kwargs for client in gitlab_clients] == [
+        {"token": "glpat", "base_url": "https://git.example.com/gitlab",
+         "namespace": "engineering/platform"},
+        {"token": "glpat", "base_url": "https://git.example.com/gitlab",
+         "namespace": "engineering/platform"},
+    ]
+    (mgr,) = managers
+    (review_kwargs,) = review_calls
+    assert review_kwargs["forge"] is gitlab_clients[0]
+    assert review_kwargs["repos"] is mgr
 
 
 def test_parse_valid_bitbucket_url():
@@ -59,6 +202,54 @@ def test_parse_rejects_non_pr_urls(bad):
         parse_pr_url(bad)
 
 
+@pytest.mark.parametrize("url,namespace,repo", [
+    ("https://gitlab.com/group/project/-/merge_requests/9", "group", "project"),
+    ("https://git.example.com/gitlab/group/sub/project/-/merge_requests/9",
+     "group/sub", "project"),
+])
+def test_parse_valid_gitlab_url(url, namespace, repo):
+    # GitLab recognition is tied to the CONFIGURED base URL, so a
+    # self-managed instance parses against its own base, not gitlab.com
+    base = "https://gitlab.com" if "gitlab.com" in url else \
+        "https://git.example.com/gitlab"
+    assert parse_pr_url(url, gitlab_url=base) == (
+        "gitlab", namespace, repo, 9)
+
+
+def test_parse_gitlab_url_strips_surrounding_whitespace():
+    assert parse_pr_url(
+        "  https://gitlab.com/group/project/-/merge_requests/9 \n",
+        gitlab_url="https://gitlab.com") == ("gitlab", "group", "project", 9)
+
+
+@pytest.mark.parametrize("url", [
+    "https://evil.example/group/project/-/merge_requests/9",
+    "https://git.example.com/gitlab-evil/group/project/-/merge_requests/9",
+    "https://gitlab.com/group/../project/-/merge_requests/9",
+    "https://gitlab.com/group/project/-/merge_requests/9/diffs",
+])
+def test_parse_rejects_wrong_or_traversal_gitlab_urls(url):
+    # the dynamic pattern is an exact full match on the configured base,
+    # so a lookalike base path, a `..` segment, or an extra MR suffix all
+    # fail — never a partial-prefix match
+    base = "https://gitlab.com" if "gitlab.com" in url else \
+        "https://git.example.com/gitlab"
+    with pytest.raises(ValueError):
+        parse_pr_url(url, gitlab_url=base)
+
+
+def test_gitlab_url_unrecognized_without_configured_base(tmp_path):
+    # a GitLab-shaped URL on GitHub-only settings (gitlab_url is None)
+    # must not parse: no configured base, no recognition
+    settings = _settings(
+        tmp_path, bitbucket_email=None, bitbucket_username=None,
+        bitbucket_api_key=None, bitbucket_workspace=None,
+        github_token="gh", github_owner="octo-org")
+    with pytest.raises(ValueError):
+        parse_pr_url("https://gitlab.com/group/project/-/merge_requests/9",
+                     gitlab_url=settings.gitlab_url)
+
+
 def test_github_repos_use_their_own_data_dir_subtree(tmp_path):
     # a repo with the same name under the same handle on both forges
     # (e.g. "technopoetic/hone" on both) must not collide on one mirror
@@ -67,12 +258,26 @@ def test_github_repos_use_their_own_data_dir_subtree(tmp_path):
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
-        webhook_secret=None, port=8420, github_token="tok",
+        bitbucket_webhook_secret=None, port=8420, github_token="tok",
         github_owner="technopoetic")
 
     mgr = _github_repos(settings, tmp_path)
 
     assert mgr.data_dir == tmp_path / "github"
+
+
+def test_gitlab_repos_use_their_own_data_dir_subtree(tmp_path):
+    # same collision argument as the github subtree: a repo with the same
+    # name under the same handle on two forges must not share one mirror.
+    # Imported here (not module-level) so a missing helper fails this one
+    # test, not the whole module's collection.
+    from hone.cli import _gitlab_repos
+
+    settings = _settings(
+        tmp_path, gitlab_token="gl", gitlab_url="https://gitlab.com",
+        gitlab_namespace="engineering")
+
+    assert _gitlab_repos(settings, tmp_path).data_dir == tmp_path / "gitlab"
 
 
 def test_build_process_runs_live_reviews(tmp_path, monkeypatch):
@@ -84,7 +289,7 @@ def test_build_process_runs_live_reviews(tmp_path, monkeypatch):
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={"ruff": ("ruff", "check", ".")},
         repo_checks={"repo": ("ruff",)},
-        max_turns=7, webhook_secret=None, port=8420)
+        max_turns=7, bitbucket_webhook_secret=None, port=8420)
 
     calls = []
 
@@ -115,7 +320,7 @@ def test_build_process_passes_force_through(tmp_path, monkeypatch):
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
-        webhook_secret=None, port=8420)
+        bitbucket_webhook_secret=None, port=8420)
     calls = []
 
     monkeypatch.setattr("hone.cli.run_review",
@@ -136,7 +341,7 @@ def test_build_process_dispatches_on_req_forge(tmp_path, monkeypatch):
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
-        webhook_secret=None, port=8420)
+        bitbucket_webhook_secret=None, port=8420)
 
     calls = []
     monkeypatch.setattr(
@@ -145,17 +350,40 @@ def test_build_process_dispatches_on_req_forge(tmp_path, monkeypatch):
 
     bb, bb_repos = object(), object()
     gh, gh_repos = object(), object()
+    gl, gl_repos = object(), object()
     process = build_process(
-        settings, forges={"bitbucket": bb, "github": gh},
-        repo_managers={"bitbucket": bb_repos, "github": gh_repos})
+        settings, forges={"bitbucket": bb, "github": gh, "gitlab": gl},
+        repo_managers={"bitbucket": bb_repos, "github": gh_repos,
+                       "gitlab": gl_repos})
 
     process(ReviewRequest(workspace="ws", repo="repo", pr_id=1,
-                          forge="github"))
+                           forge="github"))
     process(ReviewRequest(workspace="ws", repo="repo", pr_id=2,
-                          forge="bitbucket"))
+                           forge="bitbucket"))
+    process(ReviewRequest(workspace="ws", repo="repo", pr_id=3,
+                           forge="gitlab"))
 
     assert calls[0]["forge"] is gh and calls[0]["repos"] is gh_repos
     assert calls[1]["forge"] is bb and calls[1]["repos"] is bb_repos
+    assert calls[2]["forge"] is gl and calls[2]["repos"] is gl_repos
+
+
+def test_review_bitbucket_url_requires_bitbucket_group(
+        tmp_path, monkeypatch, capsys):
+    # Bitbucket credentials are now optional, so reviewing a Bitbucket URL
+    # with no Bitbucket group must fail with a clear error (mirroring the
+    # GitHub gate), not a confusing downstream 401
+    monkeypatch.setattr(
+        "hone.cli.load_settings",
+        lambda: _settings(
+            tmp_path, bitbucket_email=None, bitbucket_username=None,
+            bitbucket_api_key=None, bitbucket_workspace=None,
+            github_token="gh", github_owner="octo-org"))
+    monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
+    rc = main([
+        "review", "https://bitbucket.org/ws/repo/pull-requests/7"])
+    assert rc == 2
+    assert "BITBUCKET_EMAIL" in capsys.readouterr().err
 
 
 def test_review_command_requires_github_config_for_github_url(
@@ -172,6 +400,92 @@ def test_review_command_requires_github_config_for_github_url(
     assert not (tmp_path / "data" / "logs").exists()
 
 
+def test_review_gitlab_url_with_gitlab_only_config(
+        tmp_path, monkeypatch, capsys):
+    # GitLab-only settings: every Bitbucket and GitHub field is None —
+    # `review` must work with only the matched configured forge's
+    # credentials
+    settings = _settings(
+        tmp_path, bitbucket_email=None, bitbucket_username=None,
+        bitbucket_api_key=None, bitbucket_workspace=None,
+        github_token=None, github_owner=None,
+        gitlab_token="glpat", gitlab_url="https://gitlab.com",
+        gitlab_namespace="engineering")
+    monkeypatch.setattr("hone.cli.load_settings", lambda: settings)
+    monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
+    monkeypatch.setattr("hone.cli.configure_logging",
+                        lambda data_dir: data_dir / "logs" / "hone.log")
+
+    gitlab_clients = []
+
+    class FakeGitLabClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            gitlab_clients.append(self)
+
+    class FakeManager:
+        def sweep_stale_worktrees(self):
+            return 0
+
+    manager = FakeManager()
+
+    review_calls = []
+
+    def fake_run_review(job, **kwargs):
+        review_calls.append((job, kwargs))
+        return SimpleNamespace(skipped=False, final_text="review",
+                               posted=True)
+
+    monkeypatch.setattr("hone.cli.GitLabClient", FakeGitLabClient)
+    monkeypatch.setattr("hone.cli._gitlab_repos",
+                        lambda settings, data_dir: manager)
+    monkeypatch.setattr("hone.cli.run_review", fake_run_review)
+
+    def bitbucket_boom(*args, **kwargs):
+        raise AssertionError(
+            "BitbucketClient must not be constructed for a GitLab review")
+    monkeypatch.setattr("hone.cli.BitbucketClient", bitbucket_boom)
+
+    rc = main(["review",
+               "https://gitlab.com/group/sub/project/-/merge_requests/9",
+               "--dry-run"])
+
+    assert rc == 0
+    # exactly one review call, and it was a dry-run job
+    ((job, kwargs),) = review_calls
+    assert (job.workspace, job.repo, job.pr_id) == ("group/sub", "project", 9)
+    assert job.dry_run is True
+    # the client is pinned to the URL's namespace, like GitHub's owner
+    (client,) = gitlab_clients
+    assert client.kwargs == {"token": "glpat",
+                             "base_url": "https://gitlab.com",
+                             "namespace": "group/sub"}
+    assert kwargs["forge"] is client and kwargs["repos"] is manager
+    assert "review" in capsys.readouterr().out  # dry-run prints the text
+
+
+def test_review_gitlab_url_requires_gitlab_token(
+        tmp_path, monkeypatch, capsys):
+    # Defensive gate mirroring the GitHub/Bitbucket ones: a Settings with
+    # the base configured but no token (only constructible directly —
+    # load_settings refuses a partial group) must fail with a clear
+    # config error, not a downstream GitLab 401
+    settings = _settings(
+        tmp_path, bitbucket_email=None, bitbucket_username=None,
+        bitbucket_api_key=None, bitbucket_workspace=None,
+        gitlab_token=None, gitlab_url="https://gitlab.com",
+        gitlab_namespace="engineering")
+    monkeypatch.setattr("hone.cli.load_settings", lambda: settings)
+    monkeypatch.setattr("hone.cli.load_dotenv", lambda: None)
+
+    rc = main(["review",
+               "https://gitlab.com/group/project/-/merge_requests/9"])
+
+    assert rc == 2
+    assert "GITLAB_TOKEN" in capsys.readouterr().err
+    assert not (tmp_path / "data" / "logs").exists()
+
+
 def test_command_requests_post_marker_comments_and_never_review(
         tmp_path, monkeypatch):
     # mute/unmute are deterministic state flips: one comment post, no LLM,
@@ -181,7 +495,7 @@ def test_command_requests_post_marker_comments_and_never_review(
         bitbucket_username="u", bitbucket_api_key="k",
         bitbucket_workspace="ws", data_dir=tmp_path,
         tool_commands={}, repo_checks={}, max_turns=7,
-        webhook_secret=None, port=8420)
+        bitbucket_webhook_secret=None, port=8420)
 
     def boom(*args, **kwargs):
         raise AssertionError("run_review must not run for a command request")

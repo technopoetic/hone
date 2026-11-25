@@ -21,10 +21,16 @@ from .config import (
 )
 from .forge import Forge
 from .github import GitHubClient
+from .gitlab import GitLabClient
 from .markers import control_comment
 from .repo import RepoManager
 from .review import ReviewJob, run_review
-from .server import CommandRequest, ReviewRequest, serve
+from .server import (
+    CommandRequest,
+    ReviewRequest,
+    serve,
+    validate_serve_webhooks,
+)
 
 _log = logging.getLogger("hone")
 
@@ -34,9 +40,17 @@ _GITHUB_PR_URL = re.compile(
     r"https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 
 
-def parse_pr_url(url: str) -> tuple[str, str, str, int]:
+def parse_pr_url(url: str, gitlab_url: str | None = None
+                 ) -> tuple[str, str, str, int]:
     """(forge, namespace, repo, pr_id). `namespace` is Bitbucket's
-    workspace or GitHub's owner — same role, different forge's word."""
+    workspace, GitHub's owner, or GitLab's (possibly nested) group path —
+    same role, different forge's word.
+
+    GitLab recognition requires the CONFIGURED base URL: an
+    arbitrary/unconfigured GitLab-shaped host is not a supported URL.
+    The dynamic pattern is an exact full match, so a lookalike base path
+    (`gitlab-evil` vs `gitlab`), a `..` namespace segment, or an extra
+    suffix after the MR number all fall through to the ValueError."""
     url = url.strip()
     m = _BITBUCKET_PR_URL.fullmatch(url)
     if m:
@@ -44,7 +58,38 @@ def parse_pr_url(url: str) -> tuple[str, str, str, int]:
     m = _GITHUB_PR_URL.fullmatch(url)
     if m:
         return "github", m.group(1), m.group(2), int(m.group(3))
-    raise ValueError(f"not a Bitbucket or GitHub PR URL: {url}")
+    if gitlab_url:
+        pattern = (
+            re.escape(gitlab_url.rstrip("/"))
+            + r"/(.+)/([^/]+)/-/merge_requests/(\d+)")
+        m = re.fullmatch(pattern, url)
+        if m:
+            namespace = m.group(1)
+            segments = namespace.split("/")
+            if all(segment not in {"", ".", ".."} for segment in segments):
+                return "gitlab", namespace, m.group(2), int(m.group(3))
+    raise ValueError(
+        f"not a supported Bitbucket, GitHub, or GitLab URL: {url}")
+
+
+def _gitlab_repos(settings: Settings, data_dir) -> RepoManager:
+    # Own data_dir subtree, same collision argument as _github_repos
+    # below: mirrors are keyed only by namespace/repo (repo.py), so a
+    # repo with the same name under the same handle on two forges would
+    # otherwise collide on one mirror and fetch from the wrong remote.
+    #
+    # gitlab_url keeps its normalized form (trailing slash stripped, and
+    # self-managed path prefixes kept), so plain concatenation builds the
+    # clone URL; nested namespaces are fine as path material since
+    # RepoManager confines paths under its data_dir.
+    #
+    # GitLab's documented convention for PAT-over-git-HTTPS: username
+    # "oauth2", the token as the password.
+    return RepoManager(
+        data_dir=data_dir / "gitlab", username="oauth2",
+        api_key=settings.gitlab_token,
+        remote_url_for=lambda namespace, repo: (
+            f"{settings.gitlab_url}/{namespace}/{repo}.git"))
 
 
 def _github_repos(settings: Settings, data_dir) -> RepoManager:
@@ -62,11 +107,13 @@ def _github_repos(settings: Settings, data_dir) -> RepoManager:
 
 
 def build_process(settings: Settings, *, forges: dict[str, Forge],
-                  repo_managers: dict[str, RepoManager]
+                  repo_managers: dict[str, RepoManager],
+                  gitlab_factory: Callable[[str], Forge] | None = None
                   ) -> Callable[[ReviewRequest | CommandRequest], None]:
     """Turn a ReviewRequest/CommandRequest into one worker action.
     `forges`/`repo_managers` are keyed by `req.forge` — whichever forges
-    are configured for this process.
+    are configured for this process. Serve supplies `gitlab_factory` because
+    one configured GitLab parent namespace admits descendant request paths.
 
     Review requests become one live (never dry-run) run_review call — the
     server has no dry-run mode, posting is its only behavior. Command
@@ -75,7 +122,9 @@ def build_process(settings: Settings, *, forges: dict[str, Forge],
     catches and logs them so one bad job never kills the server.
     """
     def process(req: ReviewRequest | CommandRequest) -> None:
-        forge = forges[req.forge]
+        forge = (gitlab_factory(req.workspace)
+                 if req.forge == "gitlab" and gitlab_factory is not None
+                 else forges[req.forge])
         if isinstance(req, CommandRequest):
             _log.info("command %s for %s/%s#%d", req.action, req.workspace,
                       req.repo, req.pr_id)
@@ -98,38 +147,53 @@ def build_process(settings: Settings, *, forges: dict[str, Forge],
 def _serve() -> int:
     try:
         settings = load_settings()
+        # Serve is live-only: with no enabled forge holding a usable
+        # webhook secret it could never post and would only accept
+        # unsigned webhooks — refuse as a config error, in the house
+        # error shape, BEFORE logging/clients/sweep leave side effects on
+        # a boot that cannot proceed. serve()'s own validation stays as
+        # defense in depth.
+        validate_serve_webhooks(settings)
     except ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 2
-
-    # Serve is live-only: without the webhook secret it could never post and
-    # would only accept unsigned webhooks — refuse as a config error, in the
-    # house error shape, BEFORE logging/clients/sweep leave side effects on a
-    # boot that cannot proceed. serve()'s own check stays as defense in depth.
-    if not settings.webhook_secret:
-        print("error: HONE_WEBHOOK_SECRET is required for serve",
-              file=sys.stderr)
         return 2
 
     # configure_logging is not idempotent — call exactly once per process.
     log_path = configure_logging(settings.data_dir)
     _log.info("logging to %s", log_path)
 
-    # No URL to parse a workspace from on this path: the server is pinned
-    # to the configured workspace (the route rejects any other), so the
-    # client is pinned to it too.
-    bitbucket = BitbucketClient(email=settings.bitbucket_email,
-                                api_key=settings.bitbucket_api_key,
-                                workspace=settings.bitbucket_workspace)
-    repos = RepoManager(data_dir=settings.data_dir,
-                        username=settings.bitbucket_username,
-                        api_key=settings.bitbucket_api_key)
-    forges: dict[str, Forge] = {"bitbucket": bitbucket}
-    repo_managers: dict[str, RepoManager] = {"bitbucket": repos}
+    # Only enabled forges get clients or request-scoped factories: a disabled
+    # forge's route is never mounted, so neither could ever receive a job.
+    forges: dict[str, Forge] = {}
+    repo_managers: dict[str, RepoManager] = {}
+    gitlab_factory: Callable[[str], Forge] | None = None
+    if settings.bitbucket_api_key:
+        # No URL to parse a workspace from on this path: the server is
+        # pinned to the configured workspace (the route rejects any
+        # other), so the client is pinned to it too.
+        forges["bitbucket"] = BitbucketClient(
+            email=settings.bitbucket_email,
+            api_key=settings.bitbucket_api_key,
+            workspace=settings.bitbucket_workspace)
+        repo_managers["bitbucket"] = RepoManager(
+            data_dir=settings.data_dir,
+            username=settings.bitbucket_username,
+            api_key=settings.bitbucket_api_key)
     if settings.github_token:
         forges["github"] = GitHubClient(token=settings.github_token,
-                                        owner=settings.github_owner)
+                                         owner=settings.github_owner)
         repo_managers["github"] = _github_repos(settings, settings.data_dir)
+    if settings.gitlab_token:
+        # The route admits descendants of the configured namespace, so each
+        # job needs a client for the namespace carried by its own request.
+        # The mirror manager resolves that same request workspace per job.
+        def gitlab_factory(namespace: str) -> Forge:
+            return GitLabClient(
+                token=settings.gitlab_token,
+                base_url=settings.gitlab_url,
+                namespace=namespace)
+
+        repo_managers["gitlab"] = _gitlab_repos(settings, settings.data_dir)
 
     # One sweep per boot: the only safe moment is process start, before the
     # worker can be mid-review. Best-effort: cleanup failing must warn,
@@ -146,7 +210,8 @@ def _serve() -> int:
         _log.info("swept %d stale worktree(s) from previous runs", removed)
 
     process = build_process(settings, forges=forges,
-                            repo_managers=repo_managers)
+                            repo_managers=repo_managers,
+                            gitlab_factory=gitlab_factory)
     serve(settings, process_factory=lambda: process)
     return 0
 
@@ -155,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(
         prog="hone",
-        description="Autonomous PR review agent (Bitbucket, GitHub)")
+        description="Autonomous PR review agent (Bitbucket, GitHub, GitLab)")
     sub = parser.add_subparsers(dest="command", required=True)
     rev = sub.add_parser("review", help="review one pull request")
     rev.add_argument("url", help="full URL of the pull request")
@@ -168,19 +233,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         return _serve()
 
-    try:
-        forge_name, namespace, repo, pr_id = parse_pr_url(args.url)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
+    # Settings load BEFORE the URL parses: GitLab recognition is tied to
+    # the configured base URL (settings.gitlab_url), so the URL alone
+    # cannot decide the forge anymore.
     try:
         settings = load_settings()
     except ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    try:
+        forge_name, namespace, repo, pr_id = parse_pr_url(
+            args.url, gitlab_url=settings.gitlab_url)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if forge_name == "github" and not settings.github_token:
         print("error: GITHUB_TOKEN and GITHUB_OWNER are required to "
               "review a GitHub PR", file=sys.stderr)
+        return 2
+    if forge_name == "bitbucket" and not settings.bitbucket_api_key:
+        # bitbucket credentials are optional now; a Bitbucket URL with no
+        # Bitbucket group must fail like the GitHub gate above, not with
+        # a confusing downstream 401
+        print("error: BITBUCKET_EMAIL, BITBUCKET_API_KEY, and "
+              "BITBUCKET_WORKSPACE are required to review a Bitbucket PR",
+              file=sys.stderr)
+        return 2
+    if forge_name == "gitlab" and not settings.gitlab_token:
+        # defensive: load_settings already refuses a partial GitLab
+        # group, so this only fires for directly-constructed Settings
+        print("error: GITLAB_TOKEN, GITLAB_URL, and GITLAB_NAMESPACE are "
+              "required to review a GitLab merge request", file=sys.stderr)
         return 2
 
     # Same INFO stream to the console as before, plus a rotating file under
@@ -192,6 +275,14 @@ def main(argv: list[str] | None = None) -> int:
         forge: Forge = GitHubClient(token=settings.github_token,
                                     owner=namespace)
         repos = _github_repos(settings, settings.data_dir)
+    elif forge_name == "gitlab":
+        # Like the GitHub branch: the client is pinned to the URL's
+        # parsed namespace (which may nest, group/sub), and mirrors live
+        # in the isolated gitlab subtree.
+        forge = GitLabClient(token=settings.gitlab_token,
+                             base_url=settings.gitlab_url,
+                             namespace=namespace)
+        repos = _gitlab_repos(settings, settings.data_dir)
     else:
         forge = BitbucketClient(email=settings.bitbucket_email,
                                 api_key=settings.bitbucket_api_key,

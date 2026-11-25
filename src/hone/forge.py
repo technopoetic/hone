@@ -18,6 +18,9 @@ class PullRequest:
     source_commit: str  # PR head sha
     dest_branch: str
     dest_commit: str    # destination tip sha
+    # Forges whose merge-request head is not a branch tip (GitLab) name the
+    # fetchable ref here; None means "use source_commit from the mirror".
+    source_ref: str | None = None
 
 
 class Forge(Protocol):

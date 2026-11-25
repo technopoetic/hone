@@ -36,6 +36,22 @@ FULL_ENV = {
     "BITBUCKET_WORKSPACE": "test-workspace",
 }
 
+GITHUB_ENV = {
+    "LLM_API_KEY": "sk-test",
+    "LLM_MODEL": "claude-sonnet-5-5",
+    "GITHUB_TOKEN": "gh-token",
+    "GITHUB_OWNER": "octo-org",
+}
+
+GITLAB_ENV = {
+    "LLM_API_KEY": "sk-test",
+    "LLM_MODEL": "claude-sonnet-5-5",
+    "GITLAB_TOKEN": "gl-token",
+    "GITLAB_URL": "https://git.example.com/gitlab/",
+    "GITLAB_NAMESPACE": "engineering/platform",
+    "GITLAB_WEBHOOK_SIGNING_TOKEN": "whsec_c2VjcmV0",
+}
+
 
 def test_full_env_loads_with_defaults(monkeypatch, tmp_path):
     # no repos.toml at cwd in the test sandbox — load_settings must not
@@ -60,13 +76,63 @@ def test_llm_base_url_from_env(monkeypatch, tmp_path):
 
 
 def test_missing_required_lists_every_gap():
+    # Forges are optional groups now, so the only unconditional requirements
+    # are the LLM values; a missing forge is a separate error (below).
     with pytest.raises(ConfigError) as err:
         load_settings({})
     msg = str(err.value)
     assert "LLM_API_KEY" in msg
     assert "LLM_MODEL" in msg
-    assert "BITBUCKET_EMAIL" in msg
-    assert "BITBUCKET_API_KEY" in msg
+    assert "BITBUCKET_EMAIL" not in msg
+    assert "BITBUCKET_API_KEY" not in msg
+
+
+@pytest.mark.parametrize("env", [GITHUB_ENV, GITLAB_ENV])
+def test_single_non_bitbucket_forge_loads(env, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    settings = load_settings(env)
+    assert settings.bitbucket_email is None
+    assert settings.bitbucket_api_key is None
+    assert settings.bitbucket_workspace is None
+
+
+def test_gitlab_settings_and_url_normalization(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    settings = load_settings(GITLAB_ENV)
+    assert settings.gitlab_token == "gl-token"
+    assert settings.gitlab_url == "https://git.example.com/gitlab"
+    assert settings.gitlab_namespace == "engineering/platform"
+    assert settings.gitlab_webhook_signing_token == "whsec_c2VjcmV0"
+
+
+def test_no_forge_is_a_config_error():
+    with pytest.raises(ConfigError, match="no forge configured"):
+        load_settings({"LLM_API_KEY": "sk", "LLM_MODEL": "m"})
+
+
+@pytest.mark.parametrize("partial", [
+    {"BITBUCKET_EMAIL": "rich@example.com"},
+    {"BITBUCKET_API_KEY": "bb", "BITBUCKET_WORKSPACE": "ws"},
+    {"GITHUB_TOKEN": "gh"},
+    {"GITLAB_TOKEN": "gl", "GITLAB_URL": "https://gitlab.com"},
+    {"GITLAB_NAMESPACE": "engineering"},
+])
+def test_partial_forge_group_is_a_config_error(partial):
+    with pytest.raises(ConfigError, match="set together"):
+        load_settings({"LLM_API_KEY": "sk", "LLM_MODEL": "m", **partial})
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://git.example.com",
+    "https:///missing-host",
+    "https://user:secret@git.example.com",
+    "https://git.example.com?x=1",
+    "https://git.example.com#fragment",
+    "https://git.example.com:abc",
+])
+def test_gitlab_url_rejects_credentials_and_malformed_bases(url):
+    with pytest.raises(ConfigError, match="GITLAB_URL"):
+        load_settings({**GITLAB_ENV, "GITLAB_URL": url})
 
 
 def test_missing_repo_config_file_is_not_an_error(tmp_path):
@@ -115,18 +181,25 @@ def test_resolve_static_checks_scopes_to_one_repo():
     assert resolve_static_checks(s, "unlisted-repo") == {}
 
 
-def test_webhook_settings_default(monkeypatch, tmp_path):
+def test_bitbucket_webhook_secret_defaults_to_unconfigured(
+        monkeypatch, tmp_path):
+    # optional until serve runs — the CLI `review` path works without it
     monkeypatch.chdir(tmp_path)
     s = load_settings(FULL_ENV)
-    assert s.webhook_secret is None          # optional until serve runs
+    assert s.bitbucket_webhook_secret is None
     assert s.port == 8420
 
 
-def test_webhook_settings_from_env(monkeypatch, tmp_path):
+def test_bitbucket_webhook_secret_uses_forge_name(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    s = load_settings({**FULL_ENV, "HONE_WEBHOOK_SECRET": "s3cr3t",
-                       "HONE_PORT": "9000"})
-    assert s.webhook_secret == "s3cr3t"
+    settings = load_settings({**FULL_ENV,
+                              "BITBUCKET_WEBHOOK_SECRET": "bb-secret"})
+    assert settings.bitbucket_webhook_secret == "bb-secret"
+
+
+def test_port_from_env(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    s = load_settings({**FULL_ENV, "HONE_PORT": "9000"})
     assert s.port == 9000
 
 

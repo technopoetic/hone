@@ -63,7 +63,12 @@ def run_review(job: ReviewJob, *, forge: Forge, repos: RepoManager,
             return ReviewResult(final_text=None, posted=False, skipped=True)
     previous_reviews = prior_review_bodies(comments)
     diffstat = forge.get_diffstat(job.repo, job.pr_id)
-    mirror = repos.ensure_mirror(job.workspace, job.repo)
+    # A GitLab MR head is not a branch tip of the target project, so the
+    # mirror needs the named ref fetched explicitly; forges without a
+    # source_ref (Bitbucket/GitHub) pass none and behave as before.
+    source_refs = (pr.source_ref,) if pr.source_ref else ()
+    mirror = repos.ensure_mirror(
+        job.workspace, job.repo, source_refs=source_refs)
     worktree = repos.create_worktree(mirror, pr.source_commit)
     try:
         base = repos.merge_base(mirror, pr.dest_branch, pr.source_commit)

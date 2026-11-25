@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from test_agent import FakeBlock, FakeClientWrapper, FakeResponse
 
 from hone.review import ReviewJob, run_review
@@ -132,6 +134,66 @@ def _runnable_responses():
                                         input={"markdown": "review body"})],
                      stop_reason="tool_use"),
     ]
+
+
+MR_REF = "refs/merge-requests/7/head"
+
+
+def capture_ensure_refs(monkeypatch, manager):
+    seen = []
+    real_ensure = manager.ensure_mirror
+
+    def ensure_spy(workspace, repo, source_refs=()):
+        seen.append(tuple(source_refs))
+        return real_ensure(workspace, repo, source_refs=source_refs)
+
+    monkeypatch.setattr(manager, "ensure_mirror", ensure_spy)
+    return seen
+
+
+def test_review_passes_source_ref_to_mirror(
+        tmp_path, fixture_repo, monkeypatch):
+    from hone.repo import RepoManager
+
+    fixture_repo["git"]("update-ref", MR_REF, fixture_repo["head_sha"])
+    manager = RepoManager(
+        data_dir=tmp_path / "data", username="e", api_key="k",
+        remote_url_for=lambda ws, repo: fixture_repo["url"])
+    seen_refs = capture_ensure_refs(monkeypatch, manager)
+    forge = FakeBitbucket(fixture_repo)
+    forge._pr = replace(forge._pr, source_ref=MR_REF)
+    monkeypatch.setattr(
+        "hone.review.make_client",
+        lambda api_key, base_url=None: FakeClientWrapper(
+            _runnable_responses()))
+
+    result = run_review(
+        ReviewJob(workspace="ws", repo="repo", pr_id=7, dry_run=True),
+        forge=forge, repos=manager, api_key="fake")
+
+    assert result.posted is True
+    assert seen_refs == [(MR_REF,)]
+
+
+def test_review_without_source_ref_passes_no_extra_refs(
+        tmp_path, fixture_repo, monkeypatch):
+    from hone.repo import RepoManager
+
+    manager = RepoManager(
+        data_dir=tmp_path / "data", username="e", api_key="k",
+        remote_url_for=lambda ws, repo: fixture_repo["url"])
+    seen_refs = capture_ensure_refs(monkeypatch, manager)
+    monkeypatch.setattr(
+        "hone.review.make_client",
+        lambda api_key, base_url=None: FakeClientWrapper(
+            _runnable_responses()))
+
+    result = run_review(
+        ReviewJob(workspace="ws", repo="repo", pr_id=7, dry_run=True),
+        forge=FakeBitbucket(fixture_repo), repos=manager, api_key="fake")
+
+    assert result.posted is True
+    assert seen_refs == [()]
 
 
 MUTED_COMMENTS = ["<!-- hone:muted -->\nhone muted for this PR"]
